@@ -193,7 +193,8 @@ void iommufd_device_destroy(struct iommufd_object *obj)
 	struct iommufd_device *idev =
 		container_of(obj, struct iommufd_device, obj);
 
-	iommu_device_release_dma_owner(idev->dev);
+	if (idev->dma_owner_claimed)
+		iommu_device_release_dma_owner(idev->dev);
 	iommufd_put_group(idev->igroup);
 	if (!iommufd_selftest_is_mock_dev(idev->dev))
 		iommufd_ctx_put(idev->ictx);
@@ -215,8 +216,9 @@ void iommufd_device_destroy(struct iommufd_object *obj)
  *
  * The caller must undo this with iommufd_device_unbind()
  */
-struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
-					   struct device *dev, u32 *id)
+static struct iommufd_device *
+__iommufd_device_bind(struct iommufd_ctx *ictx, struct device *dev, u32 *id,
+		      bool claim_dma_owner)
 {
 	struct iommufd_device *idev;
 	struct iommufd_group *igroup;
@@ -253,9 +255,11 @@ struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 			"Use the \"allow_unsafe_interrupts\" module parameter to override\n");
 	}
 
-	rc = iommu_device_claim_dma_owner(dev, ictx);
-	if (rc)
-		goto out_group_put;
+	if (claim_dma_owner) {
+		rc = iommu_device_claim_dma_owner(dev, ictx);
+		if (rc)
+			goto out_group_put;
+	}
 
 	idev = iommufd_object_alloc(ictx, idev, IOMMUFD_OBJ_DEVICE);
 	if (IS_ERR(idev)) {
@@ -268,6 +272,7 @@ struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 	idev->dev = dev;
 	idev->enforce_cache_coherency =
 		device_iommu_capable(dev, IOMMU_CAP_ENFORCE_CACHE_COHERENCY);
+	idev->dma_owner_claimed = claim_dma_owner;
 	/* The calling driver is a user until iommufd_device_unbind() */
 	refcount_inc(&idev->obj.users);
 	/* igroup refcount moves into iommufd_device */
@@ -284,12 +289,37 @@ struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 	return idev;
 
 out_release_owner:
-	iommu_device_release_dma_owner(dev);
+	if (claim_dma_owner)
+		iommu_device_release_dma_owner(dev);
 out_group_put:
 	iommufd_put_group(igroup);
 	return ERR_PTR(rc);
 }
+
+struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
+					   struct device *dev, u32 *id)
+{
+	return __iommufd_device_bind(ictx, dev, id, true);
+}
 EXPORT_SYMBOL_NS_GPL(iommufd_device_bind, "IOMMUFD");
+
+/**
+ * iommufd_device_pasid_bind - Bind a physical device for PASID-only DMA
+ * @ictx: iommufd file descriptor
+ * @dev: Pointer to a physical device struct
+ * @id: Output ID number to return to userspace for this device
+ *
+ * This is for mediated devices whose host driver keeps RID/default-domain
+ * ownership and only delegates selected PASIDs to iommufd. The returned idev
+ * may be used with iommufd_device_attach(), iommufd_device_replace(), and
+ * iommufd_device_detach() only for real PASID values, not IOMMU_NO_PASID.
+ */
+struct iommufd_device *iommufd_device_pasid_bind(struct iommufd_ctx *ictx,
+						 struct device *dev, u32 *id)
+{
+	return __iommufd_device_bind(ictx, dev, id, false);
+}
+EXPORT_SYMBOL_NS_GPL(iommufd_device_pasid_bind, "IOMMUFD");
 
 /**
  * iommufd_ctx_has_group - True if any device within the group is bound
@@ -872,6 +902,7 @@ iommufd_device_auto_get_domain(struct iommufd_device *idev, ioasid_t pasid,
 	 * directly allocate a domain.
 	 */
 	bool immediate_attach = do_attach == iommufd_device_do_attach;
+	u32 flags = pasid == IOMMU_NO_PASID ? 0 : IOMMU_HWPT_ALLOC_PASID;
 	struct iommufd_hw_pagetable *destroy_hwpt;
 	struct iommufd_hwpt_paging *hwpt_paging;
 	struct iommufd_hw_pagetable *hwpt;
@@ -908,7 +939,7 @@ iommufd_device_auto_get_domain(struct iommufd_device *idev, ioasid_t pasid,
 	}
 
 	hwpt_paging = iommufd_hwpt_paging_alloc(idev->ictx, ioas, idev, pasid,
-						0, immediate_attach, NULL);
+						flags, immediate_attach, NULL);
 	if (IS_ERR(hwpt_paging)) {
 		destroy_hwpt = ERR_CAST(hwpt_paging);
 		goto out_unlock;
@@ -1004,6 +1035,9 @@ int iommufd_device_attach(struct iommufd_device *idev, ioasid_t pasid,
 {
 	int rc;
 
+	if (!idev->dma_owner_claimed && pasid == IOMMU_NO_PASID)
+		return -EOPNOTSUPP;
+
 	rc = iommufd_device_change_pt(idev, pasid, pt_id,
 				      &iommufd_device_do_attach);
 	if (rc)
@@ -1038,6 +1072,9 @@ EXPORT_SYMBOL_NS_GPL(iommufd_device_attach, "IOMMUFD");
 int iommufd_device_replace(struct iommufd_device *idev, ioasid_t pasid,
 			   u32 *pt_id)
 {
+	if (!idev->dma_owner_claimed && pasid == IOMMU_NO_PASID)
+		return -EOPNOTSUPP;
+
 	return iommufd_device_change_pt(idev, pasid, pt_id,
 					&iommufd_device_do_replace);
 }

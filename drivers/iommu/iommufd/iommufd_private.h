@@ -488,6 +488,7 @@ struct iommufd_device {
 	/* always the physical device */
 	struct device *dev;
 	bool enforce_cache_coherency;
+	bool dma_owner_claimed;
 	struct iommufd_vdevice *vdev;
 	bool destroying;
 };
