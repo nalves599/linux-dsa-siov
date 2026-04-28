@@ -1713,6 +1713,52 @@ static ssize_t event_log_size_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(event_log_size);
 
+#if IS_ENABLED(CONFIG_INTEL_IDXD_VFIO)
+static ssize_t vfio_vdevs_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct idxd_device *idxd = confdev_to_idxd(dev);
+
+	return idxd_vdevs_show(idxd, buf);
+}
+static DEVICE_ATTR_RO(vfio_vdevs);
+
+static ssize_t vfio_create_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct idxd_device *idxd = confdev_to_idxd(dev);
+	int rc;
+
+	rc = idxd_vdev_create(idxd, buf);
+	if (rc)
+		return rc;
+
+	return count;
+}
+static DEVICE_ATTR_WO(vfio_create);
+
+static ssize_t vfio_destroy_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct idxd_device *idxd = confdev_to_idxd(dev);
+	unsigned int id;
+	int rc;
+
+	rc = kstrtouint(buf, 0, &id);
+	if (rc)
+		return rc;
+
+	rc = idxd_vdev_destroy(idxd, id);
+	if (rc)
+		return rc;
+
+	return count;
+}
+static DEVICE_ATTR_WO(vfio_destroy);
+#endif
+
 static bool idxd_device_attr_max_batch_size_invisible(struct attribute *attr,
 						      struct idxd_device *idxd)
 {
@@ -1750,6 +1796,17 @@ static bool idxd_device_attr_event_log_size_invisible(struct attribute *attr,
 		!idxd->hw.gen_cap.evl_support);
 }
 
+#if IS_ENABLED(CONFIG_INTEL_IDXD_VFIO)
+static bool idxd_device_attr_vfio_invisible(struct attribute *attr,
+					    struct idxd_device *idxd)
+{
+	return (attr == &dev_attr_vfio_vdevs.attr ||
+		attr == &dev_attr_vfio_create.attr ||
+		attr == &dev_attr_vfio_destroy.attr) &&
+		idxd->data->type != IDXD_TYPE_DSA;
+}
+#endif
+
 static umode_t idxd_device_attr_visible(struct kobject *kobj,
 					struct attribute *attr, int n)
 {
@@ -1767,6 +1824,11 @@ static umode_t idxd_device_attr_visible(struct kobject *kobj,
 
 	if (idxd_device_attr_event_log_size_invisible(attr, idxd))
 		return 0;
+
+#if IS_ENABLED(CONFIG_INTEL_IDXD_VFIO)
+	if (idxd_device_attr_vfio_invisible(attr, idxd))
+		return 0;
+#endif
 
 	return attr->mode;
 }
@@ -1795,6 +1857,11 @@ static struct attribute *idxd_device_attributes[] = {
 	&dev_attr_cmd_status.attr,
 	&dev_attr_iaa_cap.attr,
 	&dev_attr_event_log_size.attr,
+#if IS_ENABLED(CONFIG_INTEL_IDXD_VFIO)
+	&dev_attr_vfio_vdevs.attr,
+	&dev_attr_vfio_create.attr,
+	&dev_attr_vfio_destroy.attr,
+#endif
 	NULL,
 };
 
@@ -1812,6 +1879,9 @@ static void idxd_conf_device_release(struct device *dev)
 {
 	struct idxd_device *idxd = confdev_to_idxd(dev);
 
+	WARN_ON(!list_empty(&idxd->vdev_list));
+	ida_destroy(&idxd->vdev_ida);
+	mutex_destroy(&idxd->vdev_lock);
 	destroy_workqueue(idxd->wq);
 	kfree(idxd->groups);
 	bitmap_free(idxd->wq_enable_map);
@@ -1963,6 +2033,8 @@ int idxd_register_devices(struct idxd_device *idxd)
 void idxd_unregister_devices(struct idxd_device *idxd)
 {
 	int i;
+
+	idxd_vdev_destroy_all(idxd);
 
 	for (i = 0; i < idxd->max_wqs; i++) {
 		struct idxd_wq *wq = idxd->wqs[i];

@@ -22,6 +22,7 @@
 extern bool tc_override;
 
 struct idxd_wq;
+struct idxd_vdev;
 struct idxd_dev;
 
 enum idxd_dev_type {
@@ -33,6 +34,7 @@ enum idxd_dev_type {
 	IDXD_DEV_ENGINE,
 	IDXD_DEV_CDEV,
 	IDXD_DEV_CDEV_FILE,
+	IDXD_DEV_VFIO,
 	IDXD_DEV_MAX_TYPE,
 };
 
@@ -235,6 +237,23 @@ struct idxd_wq {
 	char driver_name[DRIVER_NAME_SIZE + 1];
 };
 
+struct idxd_vwq {
+	struct list_head node;
+	struct idxd_wq *wq;
+	unsigned int id;
+	bool shared;
+};
+
+struct idxd_vdev {
+	struct idxd_dev idxd_dev;
+	struct idxd_device *idxd;
+	struct list_head list;
+	struct list_head wqs;
+	struct mutex lock;	/* protects VDEV state */
+	int id;
+	unsigned int num_wqs;
+};
+
 struct idxd_engine {
 	struct idxd_dev idxd_dev;
 	int id;
@@ -330,6 +349,9 @@ struct idxd_device {
 	struct idxd_group **groups;
 	struct idxd_wq **wqs;
 	struct idxd_engine **engines;
+	struct list_head vdev_list;
+	struct mutex vdev_lock;	/* protects vdev_list */
+	struct ida vdev_ida;
 
 	struct iommu_sva *sva;
 	unsigned int pasid;
@@ -446,6 +468,16 @@ enum idxd_completion_status {
 #define idxd_dev_to_idxd(idxd_dev) container_of(idxd_dev, struct idxd_device, idxd_dev)
 #define idxd_dev_to_wq(idxd_dev) container_of(idxd_dev, struct idxd_wq, idxd_dev)
 
+static inline struct device *vdev_confdev(struct idxd_vdev *vdev)
+{
+	return &vdev->idxd_dev.conf_dev;
+}
+
+static inline struct idxd_vdev *idxd_dev_to_vdev(struct idxd_dev *idxd_dev)
+{
+	return container_of(idxd_dev, struct idxd_vdev, idxd_dev);
+}
+
 static inline struct idxd_device_driver *wq_to_idxd_drv(struct idxd_wq *wq)
 {
 	struct device *dev = wq_confdev(wq);
@@ -467,6 +499,13 @@ static inline struct idxd_wq *confdev_to_wq(struct device *dev)
 	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
 
 	return idxd_dev_to_wq(idxd_dev);
+}
+
+static inline struct idxd_vdev *confdev_to_vdev(struct device *dev)
+{
+	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
+
+	return idxd_dev_to_vdev(idxd_dev);
 }
 
 static inline struct idxd_engine *confdev_to_engine(struct device *dev)
@@ -736,6 +775,10 @@ static inline void idxd_desc_complete(struct idxd_desc *desc,
 
 int idxd_register_devices(struct idxd_device *idxd);
 void idxd_unregister_devices(struct idxd_device *idxd);
+int idxd_vdev_create(struct idxd_device *idxd, const char *buf);
+int idxd_vdev_destroy(struct idxd_device *idxd, unsigned int id);
+void idxd_vdev_destroy_all(struct idxd_device *idxd);
+ssize_t idxd_vdevs_show(struct idxd_device *idxd, char *buf);
 void idxd_wqs_quiesce(struct idxd_device *idxd);
 bool idxd_queue_int_handle_resubmit(struct idxd_desc *desc);
 void multi_u64_to_bmap(unsigned long *bmap, u64 *val, int count);

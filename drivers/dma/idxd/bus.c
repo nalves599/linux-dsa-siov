@@ -6,7 +6,6 @@
 #include <linux/device.h>
 #include "idxd.h"
 
-
 int __idxd_driver_register(struct idxd_device_driver *idxd_drv, struct module *owner,
 			   const char *mod_name)
 {
@@ -37,7 +36,8 @@ static int idxd_config_bus_match(struct device *dev,
 {
 	const struct idxd_device_driver *idxd_drv =
 		container_of_const(drv, struct idxd_device_driver, drv);
-	struct idxd_dev *idxd_dev = confdev_to_idxd_dev(dev);
+	const struct idxd_dev *idxd_dev =
+		container_of_const(dev, struct idxd_dev, conf_dev);
 	int i = 0;
 
 	while (idxd_drv->type[i] != IDXD_DEV_NONE) {
@@ -69,7 +69,11 @@ static void idxd_config_bus_remove(struct device *dev)
 
 static int idxd_bus_uevent(const struct device *dev, struct kobj_uevent_env *env)
 {
-	return add_uevent_var(env, "MODALIAS=" IDXD_DEVICES_MODALIAS_FMT, 0);
+	const struct idxd_dev *idxd_dev =
+		container_of_const(dev, struct idxd_dev, conf_dev);
+
+	return add_uevent_var(env, "MODALIAS=" IDXD_DEVICES_MODALIAS_FMT,
+			      idxd_dev->type);
 }
 
 const struct bus_type dsa_bus_type = {

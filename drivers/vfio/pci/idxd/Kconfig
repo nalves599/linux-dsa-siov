@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config INTEL_IDXD_VFIO
+	tristate "Intel DSA SIOV VFIO work queue support"
+	depends on INTEL_IDXD
+	depends on INTEL_IDXD_SVM
+	depends on VFIO_DEVICE_CDEV
+	depends on IOMMUFD
+	select VFIO_PCI_CORE
+	help
+	  This driver provides the VFIO PCI side of Intel(R) DSA
+	  virtualization support. It is intended to expose selected IDXD
+	  work queues to userspace as VFIO devices while the IDXD core driver
+	  owns accelerator discovery and configuration.
+
+	  To compile this as a module, choose M here: the module will be
+	  called idxd_vfio_pci.
