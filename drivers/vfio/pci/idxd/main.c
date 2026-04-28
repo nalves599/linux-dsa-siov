@@ -40,6 +40,11 @@
 #define IDXD_VDEV_WQCFG_IDX2_WR_MASK (BIT(0) | GENMASK(27, 8) |	\
 				       BIT(28) | BIT(29))
 
+static bool allow_unsafe_silicon;
+module_param(allow_unsafe_silicon, bool, 0644);
+MODULE_PARM_DESC(allow_unsafe_silicon,
+		 "Allow VFIO portal mapping on DSA silicon affected by unsafe user submission behavior");
+
 struct idxd_vfio_device {
 	struct vfio_device vdev;
 	struct idxd_vdev *ivdev;
@@ -56,6 +61,8 @@ struct idxd_vfio_device {
 	u32 cmdsts;
 	u64 evlcfg[2];
 	u64 evlstatus;
+
+	void __iomem **shared_unlimited_portals;
 
 	struct mutex pasid_lock;	/* protects default_host_pasid */
 	u32 default_host_pasid;
@@ -699,31 +706,104 @@ static int idxd_vfio_bar2_pos(struct idxd_vfio_device *vfio_dev, loff_t pos,
 	return 0;
 }
 
+static bool idxd_vfio_portal_access_allowed(struct idxd_wq *wq)
+{
+	return wq->idxd->user_submission_safe || allow_unsafe_silicon ||
+	       capable(CAP_SYS_RAWIO);
+}
+
+static int idxd_vfio_validate_trapped_desc(struct idxd_wq *wq,
+					   const struct dsa_raw_desc *raw)
+{
+	struct idxd_dev *idxd_dev = &wq->idxd->idxd_dev;
+	const struct dsa_hw_desc *desc = (const struct dsa_hw_desc *)raw;
+
+	if (!is_dsa_dev(idxd_dev))
+		return 0;
+
+	if (desc->completion_addr &&
+	    !IS_ALIGNED(desc->completion_addr, wq->idxd->data->align))
+		return -EINVAL;
+
+	if (desc->opcode == DSA_OPCODE_BATCH &&
+	    wq->idxd->hw.version == DEVICE_VERSION_1 &&
+	    !wq->idxd->user_submission_safe && !allow_unsafe_silicon)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int idxd_vfio_get_live_wq(struct idxd_wq *wq)
+{
+	if (wq->idxd->state != IDXD_DEV_ENABLED || wq->state != IDXD_WQ_ENABLED)
+		return -EIO;
+
+	if (!percpu_ref_tryget_live(&wq->wq_active)) {
+		wait_for_completion(&wq->wq_resurrect);
+		if (!percpu_ref_tryget_live(&wq->wq_active))
+			return -ENXIO;
+	}
+
+	if (wq->idxd->state != IDXD_DEV_ENABLED || wq->state != IDXD_WQ_ENABLED) {
+		percpu_ref_put(&wq->wq_active);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int idxd_vfio_submit_shared_unlimited(struct idxd_vfio_device *vfio_dev,
+					     struct idxd_vwq *vwq,
+					     const struct dsa_raw_desc *desc,
+					     u64 portal_offset)
+{
+	struct idxd_wq *wq = vwq->wq;
+	void __iomem *portal = vfio_dev->shared_unlimited_portals[vwq->id];
+	int rc;
+
+	if (!portal)
+		return -ENODEV;
+
+	rc = idxd_vfio_validate_trapped_desc(wq, desc);
+	if (rc)
+		return rc;
+
+	rc = idxd_vfio_get_live_wq(wq);
+	if (rc)
+		return rc;
+
+	/*
+	 * The guest descriptor was copied into normal memory. Flush it before
+	 * ringing the host-owned unlimited portal. MOVDIR64B does not provide a
+	 * retry status, so forward progress here means holding the live WQ ref
+	 * across a physical unlimited-portal submission.
+	 */
+	wmb();
+	iosubmit_cmds512(portal + portal_offset, desc, 1);
+
+	percpu_ref_put(&wq->wq_active);
+	return 0;
+}
+
 static ssize_t idxd_vfio_bar2_write(struct idxd_vfio_device *vfio_dev,
 				    const char __user *buf, size_t count,
 				    loff_t pos)
 {
 	struct idxd_vwq *vwq;
 	enum idxd_portal_prot prot;
-	struct dsa_hw_desc desc;
-	void __iomem *portal;
+	struct dsa_raw_desc desc __aligned(64);
 	u64 portal_offset;
-	phys_addr_t paddr;
 	int rc;
-
-	mutex_lock(&vfio_dev->pasid_lock);
-	if (!vfio_dev->pasid_attached) {
-		mutex_unlock(&vfio_dev->pasid_lock);
-		return -EIO;
-	}
-	mutex_unlock(&vfio_dev->pasid_lock);
 
 	rc = idxd_vfio_bar2_pos(vfio_dev, pos, &vwq, &prot, &portal_offset);
 	if (rc)
 		return rc;
 
-	if (prot != IDXD_PORTAL_UNLIMITED)
+	if (prot != IDXD_PORTAL_UNLIMITED || !vwq->shared)
 		return -EINVAL;
+
+	if (!idxd_vfio_portal_access_allowed(vwq->wq))
+		return -EPERM;
 
 	if (portal_offset + count > PAGE_SIZE ||
 	    !IS_ALIGNED(portal_offset, sizeof(desc)) ||
@@ -733,16 +813,10 @@ static ssize_t idxd_vfio_bar2_write(struct idxd_vfio_device *vfio_dev,
 	if (copy_from_user(&desc, buf, sizeof(desc)))
 		return -EFAULT;
 
-	paddr = pci_resource_start(vwq->wq->idxd->pdev, IDXD_WQ_BAR);
-	paddr += idxd_get_wq_portal_full_offset(vwq->wq->id,
-						IDXD_PORTAL_UNLIMITED);
-
-	portal = ioremap(paddr, PAGE_SIZE);
-	if (!portal)
-		return -ENOMEM;
-
-	iosubmit_cmds512(portal + portal_offset, &desc, 1);
-	iounmap(portal);
+	rc = idxd_vfio_submit_shared_unlimited(vfio_dev, vwq, &desc,
+					       portal_offset);
+	if (rc)
+		return rc;
 
 	return count;
 }
@@ -927,13 +1001,8 @@ static int idxd_vfio_mmap(struct vfio_device *vdev, struct vm_area_struct *vma)
 	if (index != VFIO_PCI_BAR2_REGION_INDEX)
 		return -EINVAL;
 
-	mutex_lock(&vfio_dev->pasid_lock);
-	if (!vfio_dev->pasid_attached) {
-		mutex_unlock(&vfio_dev->pasid_lock);
-		return -EIO;
-	}
-	mutex_unlock(&vfio_dev->pasid_lock);
-
+	if (!(vma->vm_flags & VM_SHARED) || vma->vm_end < vma->vm_start)
+		return -EINVAL;
 	if ((vma->vm_end - vma->vm_start) != PAGE_SIZE)
 		return -EINVAL;
 
@@ -944,16 +1013,17 @@ static int idxd_vfio_mmap(struct vfio_device *vdev, struct vm_area_struct *vma)
 	if (portal_offset || (prot == IDXD_PORTAL_UNLIMITED && vwq->shared))
 		return -EINVAL;
 
-	if (!vwq->wq->idxd->user_submission_safe && !capable(CAP_SYS_RAWIO))
+	if (!idxd_vfio_portal_access_allowed(vwq->wq))
 		return -EPERM;
 
 	paddr = pci_resource_start(vwq->wq->idxd->pdev, IDXD_WQ_BAR);
 	paddr += idxd_get_wq_portal_full_offset(vwq->wq->id, prot);
 
-	vm_flags_set(vma, VM_DONTCOPY);
+	vm_flags_set(vma, VM_ALLOW_ANY_UNCACHED | VM_IO | VM_PFNMAP |
+		     VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-	return remap_pfn_range(vma, vma->vm_start, paddr >> PAGE_SHIFT,
-			       PAGE_SIZE, vma->vm_page_prot);
+	return io_remap_pfn_range(vma, vma->vm_start, paddr >> PAGE_SHIFT,
+				  PAGE_SIZE, vma->vm_page_prot);
 }
 
 static int idxd_vfio_bind_iommufd(struct vfio_device *vdev,
@@ -1075,6 +1145,59 @@ static void idxd_vfio_free_bar0(struct idxd_vfio_device *vfio_dev)
 	kfree(vfio_dev->wqcfg);
 }
 
+static void __iomem *idxd_vfio_ioremap_portal(struct idxd_vwq *vwq,
+					      enum idxd_portal_prot prot)
+{
+	phys_addr_t paddr;
+
+	paddr = pci_resource_start(vwq->wq->idxd->pdev, IDXD_WQ_BAR);
+	paddr += idxd_get_wq_portal_full_offset(vwq->wq->id, prot);
+
+	return ioremap(paddr, PAGE_SIZE);
+}
+
+static void idxd_vfio_free_bar2(struct idxd_vfio_device *vfio_dev)
+{
+	unsigned int i;
+
+	if (!vfio_dev->shared_unlimited_portals)
+		return;
+
+	for (i = 0; i < vfio_dev->ivdev->num_wqs; i++) {
+		if (vfio_dev->shared_unlimited_portals[i])
+			iounmap(vfio_dev->shared_unlimited_portals[i]);
+	}
+	kfree(vfio_dev->shared_unlimited_portals);
+	vfio_dev->shared_unlimited_portals = NULL;
+}
+
+static int idxd_vfio_init_bar2(struct idxd_vfio_device *vfio_dev)
+{
+	struct idxd_vdev *ivdev = vfio_dev->ivdev;
+	struct idxd_vwq *vwq;
+
+	vfio_dev->shared_unlimited_portals =
+		kcalloc(ivdev->num_wqs,
+			sizeof(*vfio_dev->shared_unlimited_portals),
+			GFP_KERNEL);
+	if (!vfio_dev->shared_unlimited_portals)
+		return -ENOMEM;
+
+	list_for_each_entry(vwq, &ivdev->wqs, node) {
+		if (!vwq->shared)
+			continue;
+
+		vfio_dev->shared_unlimited_portals[vwq->id] =
+			idxd_vfio_ioremap_portal(vwq, IDXD_PORTAL_UNLIMITED);
+		if (!vfio_dev->shared_unlimited_portals[vwq->id]) {
+			idxd_vfio_free_bar2(vfio_dev);
+			return -ENOMEM;
+		}
+	}
+
+	return 0;
+}
+
 static int idxd_vfio_probe(struct idxd_dev *idxd_dev)
 {
 	struct idxd_vdev *ivdev = idxd_dev_to_vdev(idxd_dev);
@@ -1097,13 +1220,19 @@ static int idxd_vfio_probe(struct idxd_dev *idxd_dev)
 	if (rc)
 		goto err_drvdata;
 
-	rc = vfio_register_emulated_iommu_dev(&vfio_dev->vdev);
+	rc = idxd_vfio_init_bar2(vfio_dev);
 	if (rc)
 		goto err_bar0;
+
+	rc = vfio_register_emulated_iommu_dev(&vfio_dev->vdev);
+	if (rc)
+		goto err_bar2;
 
 	dev_info(dev, "registered VFIO VDEV with %u WQ(s)\n", ivdev->num_wqs);
 	return 0;
 
+err_bar2:
+	idxd_vfio_free_bar2(vfio_dev);
 err_bar0:
 	idxd_vfio_free_bar0(vfio_dev);
 err_drvdata:
@@ -1122,6 +1251,7 @@ static void idxd_vfio_remove(struct idxd_dev *idxd_dev)
 
 	dev_set_drvdata(dev, NULL);
 	vfio_unregister_group_dev(&vfio_dev->vdev);
+	idxd_vfio_free_bar2(vfio_dev);
 	idxd_vfio_free_bar0(vfio_dev);
 	mutex_destroy(&vfio_dev->pasid_lock);
 	mutex_destroy(&vfio_dev->bar0_lock);
