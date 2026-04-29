@@ -359,3 +359,11 @@ Contact:	dmaengine@vger.kernel.org
 Description:	Show the process id of the application that opened the file. This is
 		helpful information for a monitor daemon that wants to kill the
 		application that opened the file.
+
+What:		/sys/bus/dsa/devices/wq<m>.<n>/dsa<x>\!wq<m>.<n>/file<y>/pasid
+Date:		April 29, 2026
+KernelVersion:	6.18.0
+Contact:	dmaengine@vger.kernel.org
+Description:	Show the PASID allocated for the application that opened the file.
+		This attribute is visible only when user PASID/SVA support is
+		enabled for the WQ.

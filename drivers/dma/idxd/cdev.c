@@ -86,10 +86,19 @@ static ssize_t pid_show(struct device *dev, struct device_attribute *attr, char 
 }
 static DEVICE_ATTR_RO(pid);
 
+static ssize_t pasid_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct idxd_user_context *ctx = dev_to_uctx(dev);
+
+	return sysfs_emit(buf, "%u\n", ctx->pasid);
+}
+static DEVICE_ATTR_RO(pasid);
+
 static struct attribute *cdev_file_attributes[] = {
 	&dev_attr_cr_faults.attr,
 	&dev_attr_cr_fault_failures.attr,
 	&dev_attr_pid.attr,
+	&dev_attr_pasid.attr,
 	NULL
 };
 

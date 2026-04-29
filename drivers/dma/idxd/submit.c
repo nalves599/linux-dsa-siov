@@ -152,20 +152,33 @@ static void llist_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
  * Having a tunable retry mechanism allows the driver to keep trying for a bit before giving
  * up. The sysfs knob can be tuned by the system administrator.
  */
-int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc)
+int idxd_enqcmds_with_retry_count(struct idxd_wq *wq, void __iomem *portal,
+				  const void *desc, unsigned int *retry_count)
 {
 	unsigned int retries = wq->enqcmds_retries;
+	unsigned int failed_submissions = 0;
 	int rc;
 
 	do {
 		rc = enqcmds(portal, desc);
 		if (rc == 0)
 			break;
+		failed_submissions++;
 		cpu_relax();
 	} while (retries--);
 
+	if (retry_count)
+		*retry_count = failed_submissions;
+
 	return rc;
 }
+EXPORT_SYMBOL_NS_GPL(idxd_enqcmds_with_retry_count, "IDXD");
+
+int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc)
+{
+	return idxd_enqcmds_with_retry_count(wq, portal, desc, NULL);
+}
+EXPORT_SYMBOL_NS_GPL(idxd_enqcmds, "IDXD");
 
 int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 {
