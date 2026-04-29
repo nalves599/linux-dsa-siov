@@ -80,6 +80,10 @@ MODULE_AUTHOR("Qumranet");
 MODULE_DESCRIPTION("KVM support for VMX (Intel VT-x) extensions");
 MODULE_LICENSE("GPL");
 
+static u32 vmx_secondary_exec_control(struct vcpu_vmx *vmx);
+static void vmcs_set_secondary_exec_control(struct vcpu_vmx *vmx, u32 new_ctl);
+static void vmx_write_pasid_translation_fields(struct vcpu_vmx *vmx);
+
 #ifdef MODULE
 static const struct x86_cpu_id vmx_cpu_id[] = {
 	X86_MATCH_FEATURE(X86_FEATURE_VMX, NULL),
@@ -4140,6 +4144,10 @@ static void vmx_recalc_msr_intercepts(struct kvm_vcpu *vcpu)
 		vmx_set_intercept_for_msr(vcpu, MSR_IA32_XFD_ERR, MSR_TYPE_R,
 					  !guest_cpu_cap_has(vcpu, X86_FEATURE_XFD));
 
+	if (kvm_cpu_cap_has(X86_FEATURE_ENQCMD))
+		vmx_set_intercept_for_msr(vcpu, MSR_IA32_PASID, MSR_TYPE_RW,
+					  !guest_cpu_cap_has(vcpu, X86_FEATURE_ENQCMD));
+
 	if (cpu_feature_enabled(X86_FEATURE_IBPB))
 		vmx_set_intercept_for_msr(vcpu, MSR_IA32_PRED_CMD, MSR_TYPE_W,
 					  !guest_has_pred_cmd_msr(vcpu));
@@ -4173,7 +4181,15 @@ static void vmx_recalc_msr_intercepts(struct kvm_vcpu *vcpu)
 
 void vmx_recalc_intercepts(struct kvm_vcpu *vcpu)
 {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
 	vmx_recalc_msr_intercepts(vcpu);
+
+	if (cpu_has_secondary_exec_ctrls()) {
+		vmcs_set_secondary_exec_control(vmx,
+						vmx_secondary_exec_control(vmx));
+		vmx_write_pasid_translation_fields(vmx);
+	}
 }
 
 static int vmx_deliver_nested_posted_interrupt(struct kvm_vcpu *vcpu,
@@ -4639,7 +4655,243 @@ static u32 vmx_secondary_exec_control(struct vcpu_vmx *vmx)
 	if (!kvm_notify_vmexit_enabled(vcpu->kvm))
 		exec_control &= ~SECONDARY_EXEC_NOTIFY_VM_EXITING;
 
+	if (!READ_ONCE(to_kvm_vmx(vcpu->kvm)->pasid_translation_enabled))
+		exec_control &= ~SECONDARY_EXEC_PASID_TRANSLATION;
+
 	return exec_control;
+}
+
+#define VMX_PASID_TRANSLATION_PASID_MASK	GENMASK(19, 0)
+#define VMX_PASID_TRANSLATION_HIGH_DIR_BIT	BIT(19)
+#define VMX_PASID_TRANSLATION_DIR_SHIFT		10
+#define VMX_PASID_TRANSLATION_DIR_MASK		GENMASK(8, 0)
+#define VMX_PASID_TRANSLATION_TABLE_MASK	GENMASK(9, 0)
+#define VMX_PASID_TRANSLATION_DIR_ENTRIES	512
+#define VMX_PASID_TRANSLATION_TABLE_ENTRIES	1024
+#define VMX_PASID_TRANSLATION_DIR_ENTRY_VALID	BIT_ULL(0)
+#define VMX_PASID_TRANSLATION_ENTRY_VALID	BIT(31)
+
+static u64 *vmx_pasid_translation_dir(struct kvm_vmx *kvm_vmx, u32 pasid)
+{
+	if (pasid & VMX_PASID_TRANSLATION_HIGH_DIR_BIT)
+		return kvm_vmx->pasid_translation_high_dir;
+
+	return kvm_vmx->pasid_translation_low_dir;
+}
+
+static unsigned int vmx_pasid_translation_dir_index(u32 pasid)
+{
+	return (pasid >> VMX_PASID_TRANSLATION_DIR_SHIFT) &
+	       VMX_PASID_TRANSLATION_DIR_MASK;
+}
+
+static unsigned int vmx_pasid_translation_table_index(u32 pasid)
+{
+	return pasid & VMX_PASID_TRANSLATION_TABLE_MASK;
+}
+
+static void vmx_free_pasid_translation_dir(u64 *dir)
+{
+	int i;
+
+	if (!dir)
+		return;
+
+	for (i = 0; i < VMX_PASID_TRANSLATION_DIR_ENTRIES; i++) {
+		u64 entry = READ_ONCE(dir[i]);
+
+		if (entry & VMX_PASID_TRANSLATION_DIR_ENTRY_VALID)
+			free_page((unsigned long)__va(entry & PAGE_MASK));
+	}
+
+	free_page((unsigned long)dir);
+}
+
+static void vmx_free_pasid_translation(struct kvm_vmx *kvm_vmx)
+{
+	vmx_free_pasid_translation_dir(kvm_vmx->pasid_translation_low_dir);
+	vmx_free_pasid_translation_dir(kvm_vmx->pasid_translation_high_dir);
+	kvm_vmx->pasid_translation_low_dir = NULL;
+	kvm_vmx->pasid_translation_high_dir = NULL;
+	kvm_vmx->pasid_translation_enabled = false;
+}
+
+static int vmx_alloc_pasid_translation_dirs(struct kvm_vmx *kvm_vmx)
+{
+	BUILD_BUG_ON(VMX_PASID_TRANSLATION_DIR_ENTRIES * sizeof(u64) > PAGE_SIZE);
+	BUILD_BUG_ON(VMX_PASID_TRANSLATION_TABLE_ENTRIES * sizeof(u32) > PAGE_SIZE);
+
+	if (!kvm_vmx->pasid_translation_low_dir) {
+		kvm_vmx->pasid_translation_low_dir =
+			(u64 *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
+		if (!kvm_vmx->pasid_translation_low_dir)
+			return -ENOMEM;
+	}
+
+	if (!kvm_vmx->pasid_translation_high_dir) {
+		kvm_vmx->pasid_translation_high_dir =
+			(u64 *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
+		if (!kvm_vmx->pasid_translation_high_dir)
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static int vmx_get_pasid_translation_table(struct kvm_vmx *kvm_vmx,
+					   u32 pasid, u32 **table)
+{
+	unsigned int dir_idx = vmx_pasid_translation_dir_index(pasid);
+	u64 *dir = vmx_pasid_translation_dir(kvm_vmx, pasid);
+	u64 entry = READ_ONCE(dir[dir_idx]);
+	u32 *new_table;
+
+	if (entry & VMX_PASID_TRANSLATION_DIR_ENTRY_VALID) {
+		*table = __va(entry & PAGE_MASK);
+		return 0;
+	}
+
+	new_table = (u32 *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
+	if (!new_table)
+		return -ENOMEM;
+
+	entry = __pa(new_table) | VMX_PASID_TRANSLATION_DIR_ENTRY_VALID;
+	smp_wmb();
+	WRITE_ONCE(dir[dir_idx], entry);
+	*table = new_table;
+	return 0;
+}
+
+static int vmx_map_pasid_translation(struct kvm_vmx *kvm_vmx, u32 guest_pasid,
+				     u32 host_pasid)
+{
+	unsigned int idx = vmx_pasid_translation_table_index(guest_pasid);
+	u32 *table;
+	int r;
+
+	r = vmx_get_pasid_translation_table(kvm_vmx, guest_pasid, &table);
+	if (r)
+		return r;
+
+	WRITE_ONCE(table[idx], host_pasid | VMX_PASID_TRANSLATION_ENTRY_VALID);
+	return 0;
+}
+
+static void vmx_unmap_pasid_translation(struct kvm_vmx *kvm_vmx,
+					u32 guest_pasid)
+{
+	unsigned int dir_idx = vmx_pasid_translation_dir_index(guest_pasid);
+	unsigned int idx = vmx_pasid_translation_table_index(guest_pasid);
+	u64 *dir = vmx_pasid_translation_dir(kvm_vmx, guest_pasid);
+	u64 entry = READ_ONCE(dir[dir_idx]);
+	u32 *table;
+
+	if (!(entry & VMX_PASID_TRANSLATION_DIR_ENTRY_VALID))
+		return;
+
+	table = __va(entry & PAGE_MASK);
+	WRITE_ONCE(table[idx], 0);
+}
+
+static void vmx_request_pasid_translation_update(struct kvm *kvm)
+{
+	kvm_make_all_cpus_request(kvm, KVM_REQ_RECALC_INTERCEPTS);
+	kvm_make_all_cpus_request(kvm, KVM_REQ_OUTSIDE_GUEST_MODE);
+}
+
+static void vmx_write_pasid_translation_fields(struct vcpu_vmx *vmx)
+{
+	struct kvm_vmx *kvm_vmx = to_kvm_vmx(vmx->vcpu.kvm);
+	u64 low = 0, high = 0;
+
+	if (!cpu_has_vmx_pasid_translation())
+		return;
+
+	if (READ_ONCE(kvm_vmx->pasid_translation_enabled)) {
+		low = __pa(kvm_vmx->pasid_translation_low_dir);
+		high = __pa(kvm_vmx->pasid_translation_high_dir);
+	}
+
+	vmcs_write64(PASID_TRANSLATION_LOW, low);
+	vmcs_write64(PASID_TRANSLATION_HIGH, high);
+}
+
+bool vmx_has_pasid_translation(void)
+{
+	return cpu_has_vmx_pasid_translation();
+}
+
+int vmx_set_pasid_translation(struct kvm *kvm,
+			      struct kvm_x86_pasid_translation *cfg)
+{
+	struct kvm_vmx *kvm_vmx = to_kvm_vmx(kvm);
+	u32 op = cfg->flags;
+	int r = 0;
+
+	if (!cpu_has_vmx_pasid_translation())
+		return -EOPNOTSUPP;
+
+	if (cfg->pad || (op & ~(KVM_X86_PASID_TRANSLATION_ENABLE |
+				KVM_X86_PASID_TRANSLATION_DISABLE |
+				KVM_X86_PASID_TRANSLATION_MAP |
+				KVM_X86_PASID_TRANSLATION_UNMAP)))
+		return -EINVAL;
+
+	if (cfg->guest_pasid & ~VMX_PASID_TRANSLATION_PASID_MASK)
+		return -EINVAL;
+	if (cfg->host_pasid & ~VMX_PASID_TRANSLATION_PASID_MASK)
+		return -EINVAL;
+
+	mutex_lock(&kvm_vmx->pasid_translation_lock);
+
+	switch (op) {
+	case KVM_X86_PASID_TRANSLATION_ENABLE:
+		if (cfg->guest_pasid || cfg->host_pasid) {
+			r = -EINVAL;
+			break;
+		}
+
+		r = vmx_alloc_pasid_translation_dirs(kvm_vmx);
+		if (!r)
+			WRITE_ONCE(kvm_vmx->pasid_translation_enabled, true);
+		break;
+	case KVM_X86_PASID_TRANSLATION_DISABLE:
+		if (cfg->guest_pasid || cfg->host_pasid) {
+			r = -EINVAL;
+			break;
+		}
+
+		WRITE_ONCE(kvm_vmx->pasid_translation_enabled, false);
+		break;
+	case KVM_X86_PASID_TRANSLATION_MAP:
+		if (!READ_ONCE(kvm_vmx->pasid_translation_enabled)) {
+			r = -EINVAL;
+			break;
+		}
+
+		r = vmx_map_pasid_translation(kvm_vmx, cfg->guest_pasid,
+					      cfg->host_pasid);
+		break;
+	case KVM_X86_PASID_TRANSLATION_UNMAP:
+		if (cfg->host_pasid) {
+			r = -EINVAL;
+			break;
+		}
+
+		if (READ_ONCE(kvm_vmx->pasid_translation_enabled))
+			vmx_unmap_pasid_translation(kvm_vmx, cfg->guest_pasid);
+		break;
+	default:
+		r = -EINVAL;
+		break;
+	}
+
+	mutex_unlock(&kvm_vmx->pasid_translation_lock);
+
+	if (!r)
+		vmx_request_pasid_translation_update(kvm);
+
+	return r;
 }
 
 static inline int vmx_get_pid_table_order(struct kvm *kvm)
@@ -4694,6 +4946,7 @@ static void init_vmcs(struct vcpu_vmx *vmx)
 
 	if (cpu_has_secondary_exec_ctrls()) {
 		secondary_exec_controls_set(vmx, vmx_secondary_exec_control(vmx));
+		vmx_write_pasid_translation_fields(vmx);
 		if (vmx->ve_info)
 			vmcs_write64(VE_INFORMATION_ADDRESS,
 				     __pa(vmx->ve_info));
@@ -6088,6 +6341,19 @@ static int handle_notify(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+static int handle_pasid_translation(struct kvm_vcpu *vcpu)
+{
+	u64 exit_qual = vmx_get_exit_qual(vcpu);
+
+	vcpu->run->exit_reason = KVM_EXIT_X86_PASID_TRANSLATION;
+	vcpu->run->x86_pasid_translation.reason =
+		vmx_get_exit_reason(vcpu).basic;
+	vcpu->run->x86_pasid_translation.guest_pasid =
+		exit_qual & VMX_PASID_TRANSLATION_PASID_MASK;
+	vcpu->run->x86_pasid_translation.qualification = exit_qual;
+	return 0;
+}
+
 static int vmx_get_msr_imm_reg(struct kvm_vcpu *vcpu)
 {
 	return vmx_get_instr_info_reg(vmcs_read32(VMX_INSTRUCTION_INFO));
@@ -6161,6 +6427,8 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_VMFUNC]		      = handle_vmx_instruction,
 	[EXIT_REASON_PREEMPTION_TIMER]	      = handle_preemption_timer,
 	[EXIT_REASON_ENCLS]		      = handle_encls,
+	[EXIT_REASON_ENQCMD_PASID]	      = handle_pasid_translation,
+	[EXIT_REASON_ENQCMDS_PASID]	      = handle_pasid_translation,
 	[EXIT_REASON_BUS_LOCK]                = handle_bus_lock_vmexit,
 	[EXIT_REASON_NOTIFY]		      = handle_notify,
 	[EXIT_REASON_SEAMCALL]		      = handle_tdx_instruction,
@@ -7649,6 +7917,10 @@ free_vpid:
 
 int vmx_vm_init(struct kvm *kvm)
 {
+	struct kvm_vmx *kvm_vmx = to_kvm_vmx(kvm);
+
+	mutex_init(&kvm_vmx->pasid_translation_lock);
+
 	if (!ple_gap)
 		kvm_disable_exits(kvm, KVM_X86_DISABLE_EXITS_PAUSE);
 
@@ -7860,9 +8132,11 @@ void vmx_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
 
 	vmx_setup_uret_msrs(vmx);
 
-	if (cpu_has_secondary_exec_ctrls())
+	if (cpu_has_secondary_exec_ctrls()) {
 		vmcs_set_secondary_exec_control(vmx,
 						vmx_secondary_exec_control(vmx));
+		vmx_write_pasid_translation_fields(vmx);
+	}
 
 	if (guest_cpu_cap_has(vcpu, X86_FEATURE_VMX))
 		vmx->msr_ia32_feature_control_valid_bits |=
@@ -8351,6 +8625,7 @@ void vmx_vm_destroy(struct kvm *kvm)
 {
 	struct kvm_vmx *kvm_vmx = to_kvm_vmx(kvm);
 
+	vmx_free_pasid_translation(kvm_vmx);
 	free_pages((unsigned long)kvm_vmx->pid_table, vmx_get_pid_table_order(kvm));
 }
 

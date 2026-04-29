@@ -18,6 +18,9 @@ void vmx_disable_virtualization_cpu(void);
 void vmx_emergency_disable_virtualization_cpu(void);
 int vmx_vm_init(struct kvm *kvm);
 void vmx_vm_destroy(struct kvm *kvm);
+bool vmx_has_pasid_translation(void);
+int vmx_set_pasid_translation(struct kvm *kvm,
+			      struct kvm_x86_pasid_translation *cfg);
 int vmx_vcpu_precreate(struct kvm *kvm);
 int vmx_vcpu_create(struct kvm_vcpu *vcpu);
 int vmx_vcpu_pre_run(struct kvm_vcpu *vcpu);

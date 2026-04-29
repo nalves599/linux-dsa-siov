@@ -784,6 +784,10 @@ static void svm_recalc_msr_intercepts(struct kvm_vcpu *vcpu)
 		svm_disable_intercept_for_msr(vcpu, MSR_IA32_MPERF, MSR_TYPE_R);
 	}
 
+	if (kvm_cpu_cap_has(X86_FEATURE_ENQCMD))
+		svm_set_intercept_for_msr(vcpu, MSR_IA32_PASID, MSR_TYPE_RW,
+					  !guest_cpu_cap_has(vcpu, X86_FEATURE_ENQCMD));
+
 	if (kvm_cpu_cap_has(X86_FEATURE_SHSTK)) {
 		bool shstk_enabled = guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK);
 

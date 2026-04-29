@@ -80,6 +80,8 @@
 #define KVM_BUS_LOCK_DETECTION_VALID_MODE	(KVM_BUS_LOCK_DETECTION_OFF | \
 						 KVM_BUS_LOCK_DETECTION_EXIT)
 
+#define KVM_X86_PASID_MASK		GENMASK_ULL(19, 0)
+
 #define KVM_X86_NOTIFY_VMEXIT_VALID_BITS	(KVM_X86_NOTIFY_VMEXIT_ENABLED | \
 						 KVM_X86_NOTIFY_VMEXIT_USER)
 
@@ -1951,6 +1953,9 @@ struct kvm_x86_ops {
 	int (*gmem_prepare)(struct kvm *kvm, kvm_pfn_t pfn, gfn_t gfn, int max_order);
 	void (*gmem_invalidate)(kvm_pfn_t start, kvm_pfn_t end);
 	int (*gmem_max_mapping_level)(struct kvm *kvm, kvm_pfn_t pfn, bool is_private);
+	bool (*has_pasid_translation)(void);
+	int (*set_pasid_translation)(struct kvm *kvm,
+				     struct kvm_x86_pasid_translation *cfg);
 };
 
 struct kvm_x86_nested_ops {

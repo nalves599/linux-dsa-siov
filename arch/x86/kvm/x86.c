@@ -228,7 +228,7 @@ static struct kvm_user_return_msrs __percpu *user_return_msrs;
  * PT via guest XSTATE would clobber perf state), i.e. KVM doesn't support
  * IA32_XSS[bit 8] (guests can/must use RDMSR/WRMSR to save/restore PT MSRs).
  */
-#define KVM_SUPPORTED_XSS	(XFEATURE_MASK_CET_ALL)
+#define KVM_SUPPORTED_XSS	(XFEATURE_MASK_CET_ALL | XFEATURE_MASK_PASID)
 
 bool __read_mostly allow_smaller_maxphyaddr = 0;
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(allow_smaller_maxphyaddr);
@@ -1909,6 +1909,13 @@ static int __kvm_set_msr(struct kvm_vcpu *vcpu, u32 index, u64 data,
 		if (!kvm_is_valid_u_s_cet(vcpu, data))
 			return 1;
 		break;
+	case MSR_IA32_PASID:
+		if (!host_initiated &&
+		    !guest_cpu_cap_has(vcpu, X86_FEATURE_ENQCMD))
+			return KVM_MSR_RET_UNSUPPORTED;
+		if (data & ~(KVM_X86_PASID_MASK | MSR_IA32_PASID_VALID))
+			return 1;
+		break;
 	case MSR_KVM_INTERNAL_GUEST_SSP:
 		if (!host_initiated)
 			return 1;
@@ -1987,6 +1994,11 @@ static int __kvm_get_msr(struct kvm_vcpu *vcpu, u32 index, u64 *data,
 	case MSR_IA32_S_CET:
 		if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK) &&
 		    !guest_cpu_cap_has(vcpu, X86_FEATURE_IBT))
+			return KVM_MSR_RET_UNSUPPORTED;
+		break;
+	case MSR_IA32_PASID:
+		if (!host_initiated &&
+		    !guest_cpu_cap_has(vcpu, X86_FEATURE_ENQCMD))
 			return KVM_MSR_RET_UNSUPPORTED;
 		break;
 	case MSR_KVM_INTERNAL_GUEST_SSP:
@@ -3882,6 +3894,8 @@ static bool is_xstate_managed_msr(struct kvm_vcpu *vcpu, u32 msr)
 		return false;
 
 	switch (msr) {
+	case MSR_IA32_PASID:
+		return guest_cpu_cap_has(vcpu, X86_FEATURE_ENQCMD);
 	case MSR_IA32_U_CET:
 		return guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK) ||
 		       guest_cpu_cap_has(vcpu, X86_FEATURE_IBT);
@@ -4130,6 +4144,16 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 			break;
 		vcpu->arch.ia32_xss = data;
 		vcpu->arch.cpuid_dynamic_bits_dirty = true;
+		break;
+	case MSR_IA32_PASID:
+		if (!msr_info->host_initiated &&
+		    !guest_cpu_cap_has(vcpu, X86_FEATURE_ENQCMD))
+			return KVM_MSR_RET_UNSUPPORTED;
+
+		if (data & ~(KVM_X86_PASID_MASK | MSR_IA32_PASID_VALID))
+			return 1;
+
+		kvm_set_xstate_msr(vcpu, msr_info);
 		break;
 	case MSR_SMI_COUNT:
 		if (!msr_info->host_initiated)
@@ -4664,6 +4688,12 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		msr_info->data = vcpu->arch.guest_fpu.xfd_err;
 		break;
 #endif
+	case MSR_IA32_PASID:
+		if (!msr_info->host_initiated &&
+		    !guest_cpu_cap_has(vcpu, X86_FEATURE_ENQCMD))
+			return KVM_MSR_RET_UNSUPPORTED;
+		kvm_get_xstate_msr(vcpu, msr_info);
+		break;
 	case MSR_IA32_U_CET:
 	case MSR_IA32_PL0_SSP ... MSR_IA32_PL3_SSP:
 		kvm_get_xstate_msr(vcpu, msr_info);
@@ -4902,6 +4932,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		break;
 	case KVM_CAP_EXIT_HYPERCALL:
 		r = KVM_EXIT_HYPERCALL_VALID_MASK;
+		break;
+	case KVM_CAP_X86_PASID_TRANSLATION:
+		r = kvm_x86_call(has_pasid_translation)();
 		break;
 	case KVM_CAP_SET_GUEST_DEBUG2:
 		return KVM_GUESTDBG_VALID_MASK;
@@ -7281,6 +7314,20 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 #endif
 
 	switch (ioctl) {
+	case KVM_X86_SET_PASID_TRANSLATION: {
+		struct kvm_x86_pasid_translation cfg;
+
+		r = -EFAULT;
+		if (copy_from_user(&cfg, argp, sizeof(cfg)))
+			goto out;
+
+		r = -ENOTTY;
+		if (!kvm_x86_ops.set_pasid_translation)
+			goto out;
+
+		r = kvm_x86_call(set_pasid_translation)(kvm, &cfg);
+		break;
+	}
 	case KVM_SET_TSS_ADDR:
 		r = kvm_vm_ioctl_set_tss_addr(kvm, arg);
 		break;

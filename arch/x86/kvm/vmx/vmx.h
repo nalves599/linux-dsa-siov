@@ -309,6 +309,10 @@ struct kvm_vmx {
 	gpa_t ept_identity_map_addr;
 	/* Posted Interrupt Descriptor (PID) table for IPI virtualization */
 	u64 *pid_table;
+	struct mutex pasid_translation_lock;
+	bool pasid_translation_enabled;
+	u64 *pasid_translation_low_dir;
+	u64 *pasid_translation_high_dir;
 };
 
 static __always_inline struct vcpu_vt *to_vt(struct kvm_vcpu *vcpu)
@@ -579,6 +583,7 @@ static inline u8 vmx_get_rvi(void)
 	 SECONDARY_EXEC_PT_USE_GPA |					\
 	 SECONDARY_EXEC_PT_CONCEAL_VMX |				\
 	 SECONDARY_EXEC_ENABLE_VMFUNC |					\
+	 SECONDARY_EXEC_PASID_TRANSLATION |				\
 	 SECONDARY_EXEC_BUS_LOCK_DETECTION |				\
 	 SECONDARY_EXEC_NOTIFY_VM_EXITING |				\
 	 SECONDARY_EXEC_ENCLS_EXITING |					\

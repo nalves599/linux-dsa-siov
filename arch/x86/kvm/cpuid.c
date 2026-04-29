@@ -950,6 +950,7 @@ void kvm_set_cpu_caps(void)
 		F(CLDEMOTE),
 		F(MOVDIRI),
 		F(MOVDIR64B),
+		F(ENQCMD),
 		VENDOR_F(WAITPKG),
 		F(SGX_LC),
 		F(BUS_LOCK_DETECT),

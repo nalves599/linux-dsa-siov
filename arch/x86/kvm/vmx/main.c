@@ -840,6 +840,20 @@ static int vt_gmem_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn,
 	return 0;
 }
 
+static bool vt_has_pasid_translation(void)
+{
+	return vmx_has_pasid_translation();
+}
+
+static int vt_set_pasid_translation(struct kvm *kvm,
+				    struct kvm_x86_pasid_translation *cfg)
+{
+	if (is_td(kvm))
+		return -ENOTTY;
+
+	return vmx_set_pasid_translation(kvm, cfg);
+}
+
 #define vt_op(name) vt_##name
 #define vt_op_tdx_only(name) vt_##name
 #else /* CONFIG_KVM_INTEL_TDX */
@@ -874,6 +888,8 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
 	.vm_init = vt_op(vm_init),
 	.vm_destroy = vt_op(vm_destroy),
 	.vm_pre_destroy = vt_op_tdx_only(vm_pre_destroy),
+	.has_pasid_translation = vt_op(has_pasid_translation),
+	.set_pasid_translation = vt_op(set_pasid_translation),
 
 	.vcpu_precreate = vt_op(vcpu_precreate),
 	.vcpu_create = vt_op(vcpu_create),

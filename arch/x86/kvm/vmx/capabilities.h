@@ -258,6 +258,12 @@ static inline bool cpu_has_vmx_xsaves(void)
 		SECONDARY_EXEC_ENABLE_XSAVES;
 }
 
+static inline bool cpu_has_vmx_pasid_translation(void)
+{
+	return vmcs_config.cpu_based_2nd_exec_ctrl &
+		SECONDARY_EXEC_PASID_TRANSLATION;
+}
+
 static inline bool cpu_has_vmx_waitpkg(void)
 {
 	return vmcs_config.cpu_based_2nd_exec_ctrl &
