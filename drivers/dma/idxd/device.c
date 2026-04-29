@@ -16,6 +16,7 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 			  u32 *status);
 static void idxd_device_wqs_clear_state(struct idxd_device *idxd);
 static void idxd_wq_disable_cleanup(struct idxd_wq *wq);
+static int idxd_wq_load_config(struct idxd_wq *wq);
 
 /* Interrupt control bits */
 void idxd_unmask_error_interrupts(struct idxd_device *idxd)
@@ -253,6 +254,7 @@ void idxd_wq_reset(struct idxd_wq *wq)
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
 	u32 operand;
+	int rc;
 
 	if (wq->state != IDXD_WQ_ENABLED) {
 		dev_dbg(dev, "WQ %d in wrong state: %d\n", wq->id, wq->state);
@@ -262,6 +264,12 @@ void idxd_wq_reset(struct idxd_wq *wq)
 	operand = BIT(wq->id % 16) | ((wq->id / 16) << 16);
 	idxd_cmd_exec(idxd, IDXD_CMD_RESET_WQ, operand, NULL);
 	idxd_wq_disable_cleanup(wq);
+	if (!test_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags)) {
+		rc = idxd_wq_load_config(wq);
+		if (rc < 0)
+			dev_dbg(dev, "WQ %d config reload failed: %d\n",
+				wq->id, rc);
+	}
 }
 
 int idxd_wq_map_portal(struct idxd_wq *wq)
@@ -1145,11 +1153,25 @@ static int idxd_wq_load_config(struct idxd_wq *wq)
 	wq->size = wq->wqcfg->wq_size;
 	wq->threshold = wq->wqcfg->wq_thresh;
 
-	/* The driver does not support shared WQ mode in read-only config yet */
-	if (wq->wqcfg->mode == 0 || wq->wqcfg->pasid_en)
+	if (wq->wqcfg->pasid_en)
 		return -EOPNOTSUPP;
 
-	set_bit(WQ_FLAG_DEDICATED, &wq->flags);
+	if (wq->wqcfg->mode)
+		set_bit(WQ_FLAG_DEDICATED, &wq->flags);
+	else
+		clear_bit(WQ_FLAG_DEDICATED, &wq->flags);
+	if (wq->wqcfg->bof)
+		set_bit(WQ_FLAG_BLOCK_ON_FAULT, &wq->flags);
+	else
+		clear_bit(WQ_FLAG_BLOCK_ON_FAULT, &wq->flags);
+	if (wq->wqcfg->wq_ats_disable)
+		set_bit(WQ_FLAG_ATS_DISABLE, &wq->flags);
+	else
+		clear_bit(WQ_FLAG_ATS_DISABLE, &wq->flags);
+	if (wq->wqcfg->wq_prs_disable)
+		set_bit(WQ_FLAG_PRS_DISABLE, &wq->flags);
+	else
+		clear_bit(WQ_FLAG_PRS_DISABLE, &wq->flags);
 
 	wq->priority = wq->wqcfg->priority;
 
