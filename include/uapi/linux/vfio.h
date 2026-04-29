@@ -1478,6 +1478,45 @@ struct vfio_device_feature_bus_master {
 };
 #define VFIO_DEVICE_FEATURE_BUS_MASTER 10
 
+/*
+ * Intel DSA SIOV PASID control for idxd VFIO VDEVs. Host PASIDs are attached
+ * to iommufd page tables with VFIO_DEVICE_ATTACH_IOMMUFD_PT and
+ * VFIO_DEVICE_ATTACH_PASID. This feature supplies the VDEV-local policy that
+ * is not expressed by the generic attach:
+ *
+ * MAP:
+ *   Set or replace a guest PASID to host PASID mapping. The host PASID must
+ *   already be attached. GET with this op returns the resolved host PASID for
+ *   @guest_pasid, including the implicit identity mapping when @guest_pasid is
+ *   itself an attached host PASID.
+ *
+ * UNMAP:
+ *   Remove an explicit guest PASID mapping. This does not detach the host PASID
+ *   from iommufd.
+ *
+ * SET_DEFAULT:
+ *   Select the host PASID used when guest WQ PASID enable is clear and for
+ *   host-submitted forward-progress operations on shared WQs.
+ *
+ * CLEAR_DEFAULT:
+ *   Clear the selected default host PASID.
+ *
+ * GET_DEFAULT:
+ *   Return the current default host PASID in @host_pasid.
+ */
+struct vfio_device_feature_idxd_siov_pasid {
+	__u32 op;
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_MAP			0
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_UNMAP		1
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_SET_DEFAULT		2
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_CLEAR_DEFAULT	3
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_GET_DEFAULT		4
+	__u32 guest_pasid;
+	__u32 host_pasid;
+	__u32 __reserved;
+};
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID 12
+
 /* -------- API for Type1 VFIO IOMMU -------- */
 
 /**
