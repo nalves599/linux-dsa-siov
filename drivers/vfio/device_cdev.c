@@ -244,7 +244,10 @@ int vfio_df_ioctl_attach_pt(struct vfio_device_file *df,
 	return 0;
 
 out_detach:
-	device->ops->detach_ioas(device);
+	if (attach.flags & VFIO_DEVICE_ATTACH_PASID)
+		device->ops->pasid_detach_ioas(device, attach.pasid);
+	else
+		device->ops->detach_ioas(device);
 out_unlock:
 	mutex_unlock(&device->dev_set->lock);
 	return ret;
