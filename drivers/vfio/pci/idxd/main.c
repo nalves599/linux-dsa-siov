@@ -1796,6 +1796,41 @@ static void idxd_vfio_stop_bar2_forward(struct idxd_vfio_device *vfio_dev)
 	idxd_vfio_drop_bar2_forward_list(vfio_dev, &pending);
 }
 
+static void idxd_vfio_reset_bar2(struct idxd_vfio_device *vfio_dev)
+{
+	LIST_HEAD(pending);
+	unsigned int i;
+
+	spin_lock(&vfio_dev->bar2_forward_lock);
+	vfio_dev->bar2_forward_stopping = true;
+	list_splice_init(&vfio_dev->bar2_forward_list, &pending);
+	spin_unlock(&vfio_dev->bar2_forward_lock);
+
+	flush_work(&vfio_dev->bar2_forward_work);
+
+	spin_lock(&vfio_dev->bar2_forward_lock);
+	vfio_dev->bar2_forward_work_active = false;
+	vfio_dev->bar2_forward_stopping = false;
+	spin_unlock(&vfio_dev->bar2_forward_lock);
+
+	idxd_vfio_drop_bar2_forward_list(vfio_dev, &pending);
+
+	mutex_lock(&vfio_dev->bar2_lock);
+	if (vfio_dev->shared_unlimited_descs) {
+		for (i = 0; i < vfio_dev->ivdev->num_wqs; i++) {
+			if (!vfio_dev->shared_unlimited_descs[i])
+				continue;
+			memset(vfio_dev->shared_unlimited_descs[i], 0,
+			       IDXD_VFIO_BAR2_DESC_SLOTS *
+			       sizeof(**vfio_dev->shared_unlimited_descs));
+		}
+	}
+	mutex_unlock(&vfio_dev->bar2_lock);
+
+	atomic_set(&vfio_dev->bar2_force_unlimited_retries, 0);
+	idxd_vfio_reset_bar2_stats(vfio_dev);
+}
+
 static void idxd_vfio_reset_trapped_desc(struct idxd_vfio_device *vfio_dev,
 					 struct idxd_vwq *vwq,
 					 u64 portal_offset)
@@ -2120,12 +2155,11 @@ static int idxd_vfio_get_irq_info(struct idxd_vfio_device *vfio_dev,
 	if (info.argsz < minsz || info.index >= VFIO_PCI_NUM_IRQS)
 		return -EINVAL;
 
-	info.flags = 0;
-	info.count = 0;
-	if (info.index == VFIO_PCI_MSIX_IRQ_INDEX) {
-		info.flags = VFIO_IRQ_INFO_EVENTFD | VFIO_IRQ_INFO_NORESIZE;
-		info.count = idxd_vfio_msix_count(vfio_dev);
-	}
+	if (info.index != VFIO_PCI_MSIX_IRQ_INDEX)
+		return -EINVAL;
+
+	info.flags = VFIO_IRQ_INFO_EVENTFD | VFIO_IRQ_INFO_NORESIZE;
+	info.count = idxd_vfio_msix_count(vfio_dev);
 
 	return copy_to_user((void __user *)arg, &info, minsz) ? -EFAULT : 0;
 }
@@ -2596,6 +2630,23 @@ static int idxd_vfio_ioctl_feature(struct vfio_device *vdev, u32 flags,
 	}
 }
 
+static int idxd_vfio_reset_device(struct idxd_vfio_device *vfio_dev)
+{
+	int rc;
+
+	idxd_vfio_reset_bar2(vfio_dev);
+
+	mutex_lock(&vfio_dev->bar0_lock);
+	rc = idxd_vfio_restore_all_wq_pasids(vfio_dev);
+	if (!rc) {
+		idxd_vfio_init_config(vfio_dev);
+		idxd_vfio_reset_bar0(vfio_dev);
+	}
+	mutex_unlock(&vfio_dev->bar0_lock);
+
+	return rc;
+}
+
 static long idxd_vfio_ioctl(struct vfio_device *vdev, unsigned int cmd,
 			    unsigned long arg)
 {
@@ -2613,7 +2664,7 @@ static long idxd_vfio_ioctl(struct vfio_device *vdev, unsigned int cmd,
 		if (info.argsz < minsz)
 			return -EINVAL;
 
-		info.flags = VFIO_DEVICE_FLAGS_PCI;
+		info.flags = VFIO_DEVICE_FLAGS_PCI | VFIO_DEVICE_FLAGS_RESET;
 		info.num_regions = VFIO_PCI_NUM_REGIONS;
 		info.num_irqs = VFIO_PCI_NUM_IRQS;
 		info.cap_offset = 0;
@@ -2628,6 +2679,8 @@ static long idxd_vfio_ioctl(struct vfio_device *vdev, unsigned int cmd,
 		return idxd_vfio_get_irq_info(vfio_dev, arg);
 	case VFIO_DEVICE_SET_IRQS:
 		return idxd_vfio_set_irqs(vfio_dev, arg);
+	case VFIO_DEVICE_RESET:
+		return idxd_vfio_reset_device(vfio_dev);
 	default:
 		return -ENOTTY;
 	}
