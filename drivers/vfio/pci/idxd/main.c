@@ -76,7 +76,14 @@ MODULE_PARM_DESC(bar2_forward_retry_limit,
 		 "Maximum host unlimited portal Retry loops for one trapped BAR2 descriptor, 0 means unlimited");
 
 struct idxd_vfio_wq_pasid {
-	u32 saved_wqcfg_pasid;
+	union wqcfg saved_wqcfg;
+	enum idxd_wq_state saved_state;
+	u32 saved_size;
+	u32 saved_threshold;
+	u32 saved_priority;
+	unsigned long saved_flags;
+	u64 saved_max_xfer_bytes;
+	u32 saved_max_batch_size;
 	ioasid_t guest_pasid;
 	ioasid_t host_pasid;
 	bool saved_wqcfg_valid;
@@ -952,6 +959,114 @@ static bool idxd_vfio_lookup_host_pasid(struct idxd_vfio_device *vfio_dev,
 	return found;
 }
 
+static void idxd_vfio_write_wqcfg(struct idxd_wq *wq)
+{
+	struct idxd_device *idxd = wq->idxd;
+	unsigned int i, n;
+
+	n = min_t(unsigned int, WQCFG_STRIDES(idxd),
+		  ARRAY_SIZE(wq->wqcfg->bits));
+
+	spin_lock(&idxd->dev_lock);
+	for (i = 0; i < n; i++)
+		iowrite32(wq->wqcfg->bits[i],
+			  idxd->reg_base + WQCFG_OFFSET(idxd, wq->id, i));
+	spin_unlock(&idxd->dev_lock);
+}
+
+static void idxd_vfio_save_wq_state(struct idxd_vfio_wq_pasid *state,
+				    struct idxd_wq *wq)
+{
+	memcpy(&state->saved_wqcfg, wq->wqcfg, sizeof(state->saved_wqcfg));
+	state->saved_state = wq->state;
+	state->saved_size = wq->size;
+	state->saved_threshold = wq->threshold;
+	state->saved_priority = wq->priority;
+	state->saved_flags = wq->flags;
+	state->saved_max_xfer_bytes = wq->max_xfer_bytes;
+	state->saved_max_batch_size = wq->max_batch_size;
+	state->saved_wqcfg_valid = true;
+}
+
+static void idxd_vfio_clear_wq_pasid_state(struct idxd_vfio_wq_pasid *state)
+{
+	state->guest_pasid = IOMMU_PASID_INVALID;
+	state->host_pasid = IOMMU_PASID_INVALID;
+	state->saved_wqcfg_valid = false;
+	state->uses_default_pasid = false;
+	state->programmed = false;
+}
+
+static int idxd_vfio_restore_wq_saved_locked(struct idxd_vfio_wq_pasid *state,
+					     struct idxd_wq *wq)
+{
+	enum idxd_wq_state saved_state = state->saved_state;
+	int rc;
+
+	lockdep_assert_held(&wq->wq_lock);
+
+	if (WARN_ON(!state->saved_wqcfg_valid))
+		return -EINVAL;
+
+	rc = idxd_wq_disable(wq, false);
+	if (rc)
+		return rc;
+
+	memcpy(wq->wqcfg, &state->saved_wqcfg, sizeof(*wq->wqcfg));
+	wq->size = state->saved_size;
+	wq->threshold = state->saved_threshold;
+	wq->priority = state->saved_priority;
+	wq->flags = state->saved_flags;
+	wq->max_xfer_bytes = state->saved_max_xfer_bytes;
+	wq->max_batch_size = state->saved_max_batch_size;
+	idxd_vfio_write_wqcfg(wq);
+
+	if (saved_state == IDXD_WQ_ENABLED)
+		rc = idxd_wq_enable(wq);
+
+	return rc;
+}
+
+static bool idxd_vfio_pasid_priv_enabled(struct idxd_device *idxd)
+{
+	struct pci_dev *pdev = idxd->pdev;
+
+	return pdev->pasid_enabled &&
+	       (pdev->pasid_features & PCI_PASID_CAP_PRIV);
+}
+
+static int
+idxd_vfio_program_wq_dedicated_locked(struct idxd_vfio_wq_pasid *state,
+				      struct idxd_vwq *vwq,
+				      const union wqcfg *vconfig,
+				      ioasid_t host_pasid)
+{
+	struct idxd_wq *wq = vwq->wq;
+	union wqcfg wqcfg = state->saved_wqcfg;
+	int rc;
+
+	lockdep_assert_held(&wq->wq_lock);
+
+	rc = idxd_wq_disable(wq, false);
+	if (rc)
+		return rc;
+
+	wqcfg.wq_size = state->saved_size;
+	wqcfg.wq_thresh = 0;
+	wqcfg.mode = 1;
+	wqcfg.pasid = host_pasid;
+	wqcfg.pasid_en = 1;
+	wqcfg.priv = vconfig->priv;
+
+	memcpy(wq->wqcfg, &wqcfg, sizeof(*wq->wqcfg));
+	wq->threshold = 0;
+	wq->flags = state->saved_flags;
+	set_bit(WQ_FLAG_DEDICATED, &wq->flags);
+	idxd_vfio_write_wqcfg(wq);
+
+	return idxd_wq_enable(wq);
+}
+
 static void
 idxd_vfio_free_guest_pasid_entries_locked(struct idxd_vfio_device *vfio_dev)
 {
@@ -1008,7 +1123,6 @@ static int idxd_vfio_restore_wq_pasid(struct idxd_vfio_device *vfio_dev,
 {
 	struct idxd_vfio_wq_pasid *state;
 	struct idxd_vwq *vwq;
-	union wqcfg saved = {};
 	int rc;
 
 	if (!vfio_dev->wq_pasid || id >= vfio_dev->ivdev->num_wqs)
@@ -1025,23 +1139,14 @@ static int idxd_vfio_restore_wq_pasid(struct idxd_vfio_device *vfio_dev,
 	if (WARN_ON(!state->saved_wqcfg_valid))
 		return -EINVAL;
 
-	saved.bits[WQCFG_PASID_IDX] = state->saved_wqcfg_pasid;
-
 	mutex_lock(&vwq->wq->wq_lock);
-	if (saved.pasid_en)
-		rc = idxd_wq_set_pasid(vwq->wq, saved.pasid);
-	else
-		rc = idxd_wq_disable_pasid(vwq->wq);
+	rc = idxd_vfio_restore_wq_saved_locked(state, vwq->wq);
 	mutex_unlock(&vwq->wq->wq_lock);
 
 	if (rc)
 		return rc;
 
-	state->guest_pasid = IOMMU_PASID_INVALID;
-	state->host_pasid = IOMMU_PASID_INVALID;
-	state->saved_wqcfg_valid = false;
-	state->uses_default_pasid = false;
-	state->programmed = false;
+	idxd_vfio_clear_wq_pasid_state(state);
 	return 0;
 }
 
@@ -1121,6 +1226,7 @@ static bool idxd_vfio_default_pasid_in_use(struct idxd_vfio_device *vfio_dev)
 
 static int idxd_vfio_program_wq_pasid(struct idxd_vfio_device *vfio_dev,
 				      struct idxd_vwq *vwq,
+				      const union wqcfg *wqcfg,
 				      ioasid_t guest_pasid,
 				      ioasid_t host_pasid,
 				      bool uses_default)
@@ -1130,6 +1236,16 @@ static int idxd_vfio_program_wq_pasid(struct idxd_vfio_device *vfio_dev,
 
 	if (!vfio_dev->wq_pasid || vwq->id >= vfio_dev->ivdev->num_wqs)
 		return -EINVAL;
+	if (host_pasid & ~GENMASK(IDXD_VDEV_PASID_BITS - 1, 0))
+		return -EINVAL;
+
+	/*
+	 * A single-guest WQ that the guest configures as shared continues to
+	 * use descriptor PASIDs. The dedicated path below is the one that
+	 * requires the physical WQ PASID field to be programmed.
+	 */
+	if (!wqcfg->mode)
+		return 0;
 
 	state = &vfio_dev->wq_pasid[vwq->id];
 	if (state->programmed && state->host_pasid == host_pasid &&
@@ -1144,20 +1260,35 @@ static int idxd_vfio_program_wq_pasid(struct idxd_vfio_device *vfio_dev,
 	}
 
 	mutex_lock(&vwq->wq->wq_lock);
-	state->saved_wqcfg_pasid =
-		vwq->wq->wqcfg->bits[WQCFG_PASID_IDX];
-	state->saved_wqcfg_valid = true;
-	rc = idxd_wq_set_pasid(vwq->wq, host_pasid);
-	mutex_unlock(&vwq->wq->wq_lock);
-	if (rc) {
-		state->saved_wqcfg_valid = false;
-		return rc;
+	if (idxd_wq_refcount(vwq->wq) > 1) {
+		rc = -EBUSY;
+		goto out_unlock_wq;
 	}
-
+	if (wqcfg->priv && !idxd_vfio_pasid_priv_enabled(vwq->wq->idxd)) {
+		rc = -EOPNOTSUPP;
+		goto out_unlock_wq;
+	}
+	idxd_vfio_save_wq_state(state, vwq->wq);
 	state->guest_pasid = guest_pasid;
 	state->host_pasid = host_pasid;
 	state->uses_default_pasid = uses_default;
 	state->programmed = true;
+	rc = idxd_vfio_program_wq_dedicated_locked(state, vwq, wqcfg,
+						   host_pasid);
+out_unlock_wq:
+	mutex_unlock(&vwq->wq->wq_lock);
+
+	if (rc) {
+		int restore_rc;
+
+		restore_rc = idxd_vfio_restore_wq_pasid(vfio_dev, vwq->id);
+		if (restore_rc)
+			dev_warn(vdev_confdev(vfio_dev->ivdev),
+				 "failed to restore vWQ%u after dedicated programming failure: %d\n",
+				 vwq->id, restore_rc);
+		return rc;
+	}
+
 	return 0;
 }
 
@@ -1189,7 +1320,7 @@ static u8 idxd_vfio_prepare_wq_pasid(struct idxd_vfio_device *vfio_dev,
 	if (vwq->shared)
 		return IDXD_CMDSTS_SUCCESS;
 
-	rc = idxd_vfio_program_wq_pasid(vfio_dev, vwq, guest_pasid,
+	rc = idxd_vfio_program_wq_pasid(vfio_dev, vwq, wqcfg, guest_pasid,
 					host_pasid, uses_default);
 	if (rc) {
 		dev_warn(vdev_confdev(vfio_dev->ivdev),
