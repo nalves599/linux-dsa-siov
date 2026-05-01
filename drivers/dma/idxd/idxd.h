@@ -361,6 +361,7 @@ struct idxd_device {
 	bool request_int_handles;
 
 	u32 msix_perm_offset;
+	u32 ims_offset;
 	u32 wqcfg_offset;
 	u32 grpcfg_offset;
 	u32 perfmon_offset;
