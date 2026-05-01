@@ -8,15 +8,18 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/eventfd.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iommufd.h>
 #include <linux/kernel.h>
 #include <linux/log2.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/msi.h>
 #include <linux/pci.h>
 #include <linux/pci_ids.h>
 #include <linux/sizes.h>
+#include <linux/sysfs.h>
 #include <linux/uaccess.h>
 #include <linux/vfio.h>
 #include <linux/vfio_pci_core.h>
@@ -50,13 +53,29 @@
 			  BIT(IDXD_CMD_ABORT_WQ) |		\
 			  BIT(IDXD_CMD_RESET_WQ) |		\
 			  BIT(IDXD_CMD_DRAIN_PASID) |		\
-			  BIT(IDXD_CMD_ABORT_PASID))
+			  BIT(IDXD_CMD_ABORT_PASID) |		\
+			  BIT(IDXD_CMD_REQUEST_INT_HANDLE) |	\
+			  BIT(IDXD_CMD_RELEASE_INT_HANDLE))
 
 #define IDXD_VDEV_WQCFG_IDX2_WR_MASK (BIT(0) | GENMASK(27, 8) |	\
 				       BIT(28) | BIT(29))
 #define IDXD_VFIO_BAR2_DESC_SIZE	sizeof(struct dsa_raw_desc)
 #define IDXD_VFIO_BAR2_DESC_SLOTS	(PAGE_SIZE / IDXD_VFIO_BAR2_DESC_SIZE)
 #define IDXD_VFIO_BAR2_FORWARD_RETRIES	100000U
+#define IDXD_VFIO_IMS_ENTRY_SIZE	16
+#define IDXD_VFIO_IMS_MSG_ADDR		0
+#define IDXD_VFIO_IMS_MSG_DATA		8
+#define IDXD_VFIO_IMS_CTRL		12
+#define IDXD_VFIO_IMS_CTRL_MASK		BIT(0)
+#define IDXD_VFIO_IMS_CTRL_PENDING	BIT(1)
+#define IDXD_VFIO_IMS_CTRL_IGNORE	BIT(2)
+#define IDXD_VFIO_IMS_CTRL_PASID_EN	BIT(3)
+#define IDXD_VFIO_IMS_CTRL_PASID_SHIFT	12
+#define IDXD_VFIO_IMS_CTRL_PASID_MASK	GENMASK(31, 12)
+#define IDXD_VFIO_IMS_VALID_FLAGS				\
+	(VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_MASK |		\
+	 VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_IGNORE |		\
+	 VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_PASID)
 
 enum idxd_vfio_bar2_portal {
 	IDXD_VFIO_BAR2_UNLIMITED = 0,
@@ -137,6 +156,59 @@ struct idxd_vfio_bar2_stats {
 	atomic64_t live_wq_errors;
 };
 
+struct idxd_vfio_ims_stats {
+	atomic64_t request_cmds;
+	atomic64_t request_errors;
+	atomic64_t request_vector0_rejects;
+	atomic64_t duplicate_requests;
+	atomic64_t release_cmds;
+	atomic64_t release_errors;
+	atomic64_t release_unallocated;
+	atomic64_t handles_allocated;
+	atomic64_t handles_released;
+	atomic64_t program_cmds;
+	atomic64_t program_deferred;
+	atomic64_t program_errors;
+	atomic64_t clear_cmds;
+	atomic64_t clear_errors;
+	atomic64_t physical_clears;
+	atomic64_t pasid_teardown_clears;
+	atomic64_t all_teardown_clears;
+	atomic64_t irq_requests;
+	atomic64_t irq_frees;
+	atomic64_t signals;
+	atomic64_t pending_signals;
+	atomic64_t pending_flushes;
+	atomic64_t revoke_cmds;
+	atomic64_t revoke_errors;
+	atomic64_t revoked_vectors;
+	atomic64_t revoked_reprograms;
+	atomic64_t assertion_failures;
+	atomic64_t selftest_runs;
+	atomic64_t selftest_failures;
+};
+
+struct idxd_vfio_msix_entry {
+	struct idxd_vfio_device *vfio_dev;
+	u32 msg_addr_lo;
+	u32 msg_addr_hi;
+	u32 msg_data;
+	u32 vector_ctrl;
+	ioasid_t host_pasid;
+	unsigned int vector;
+	unsigned int host_msix_vector;
+	unsigned int ims_index;
+	int ims_handle;
+	int host_irq;
+	bool ims_allocated;
+	bool ims_configured;
+	bool ims_programmed;
+	bool ims_ignore;
+	bool host_irq_requested;
+	bool pending;
+	bool ims_revoked;
+};
+
 struct idxd_vfio_device {
 	struct vfio_device vdev;
 	struct idxd_vdev *ivdev;
@@ -156,6 +228,8 @@ struct idxd_vfio_device {
 
 	struct mutex irq_lock;	/* protects virtual MSI-X eventfds */
 	struct eventfd_ctx **msix_trigger;
+	struct idxd_vfio_msix_entry *msix_entries;
+	struct idxd_vfio_ims_stats ims_stats;
 
 	struct mutex bar2_lock;	/* protects trapped BAR2 descriptor assembly */
 	void __iomem **shared_unlimited_portals;
@@ -180,6 +254,12 @@ struct idxd_vfio_device {
 
 static void idxd_vfio_msix_signal(struct idxd_vfio_device *vfio_dev,
 				  unsigned int vector);
+static bool idxd_vfio_valid_pasid(ioasid_t pasid);
+static int idxd_vfio_alloc_ims_handles(struct idxd_vfio_device *vfio_dev);
+static void idxd_vfio_free_unused_ims_irqs(struct idxd_vfio_device *vfio_dev);
+static int idxd_vfio_revoke_ims_handles(struct idxd_vfio_device *vfio_dev,
+					unsigned int vector);
+static int idxd_vfio_run_ims_selftest(struct idxd_vfio_device *vfio_dev);
 static void idxd_vfio_bar2_forward_work(struct work_struct *work);
 
 static void idxd_vfio_reset_bar2_stats(struct idxd_vfio_device *vfio_dev)
@@ -209,6 +289,194 @@ static void idxd_vfio_reset_bar2_stats(struct idxd_vfio_device *vfio_dev)
 	atomic64_set(&stats->validation_errors, 0);
 	atomic64_set(&stats->live_wq_errors, 0);
 }
+
+static void idxd_vfio_reset_ims_stats(struct idxd_vfio_device *vfio_dev)
+{
+	struct idxd_vfio_ims_stats *stats = &vfio_dev->ims_stats;
+
+	atomic64_set(&stats->request_cmds, 0);
+	atomic64_set(&stats->request_errors, 0);
+	atomic64_set(&stats->request_vector0_rejects, 0);
+	atomic64_set(&stats->duplicate_requests, 0);
+	atomic64_set(&stats->release_cmds, 0);
+	atomic64_set(&stats->release_errors, 0);
+	atomic64_set(&stats->release_unallocated, 0);
+	atomic64_set(&stats->handles_allocated, 0);
+	atomic64_set(&stats->handles_released, 0);
+	atomic64_set(&stats->program_cmds, 0);
+	atomic64_set(&stats->program_deferred, 0);
+	atomic64_set(&stats->program_errors, 0);
+	atomic64_set(&stats->clear_cmds, 0);
+	atomic64_set(&stats->clear_errors, 0);
+	atomic64_set(&stats->physical_clears, 0);
+	atomic64_set(&stats->pasid_teardown_clears, 0);
+	atomic64_set(&stats->all_teardown_clears, 0);
+	atomic64_set(&stats->irq_requests, 0);
+	atomic64_set(&stats->irq_frees, 0);
+	atomic64_set(&stats->signals, 0);
+	atomic64_set(&stats->pending_signals, 0);
+	atomic64_set(&stats->pending_flushes, 0);
+	atomic64_set(&stats->revoke_cmds, 0);
+	atomic64_set(&stats->revoke_errors, 0);
+	atomic64_set(&stats->revoked_vectors, 0);
+	atomic64_set(&stats->revoked_reprograms, 0);
+	atomic64_set(&stats->assertion_failures, 0);
+	atomic64_set(&stats->selftest_runs, 0);
+	atomic64_set(&stats->selftest_failures, 0);
+}
+
+static ssize_t ims_stats_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct idxd_vfio_device *vfio_dev = dev_get_drvdata(dev);
+	struct idxd_vfio_ims_stats *stats;
+
+	if (!vfio_dev)
+		return -ENODEV;
+
+	stats = &vfio_dev->ims_stats;
+	return sysfs_emit(buf,
+			  "request_cmds %lld\n"
+			  "request_errors %lld\n"
+			  "request_vector0_rejects %lld\n"
+			  "duplicate_requests %lld\n"
+			  "release_cmds %lld\n"
+			  "release_errors %lld\n"
+			  "release_unallocated %lld\n"
+			  "handles_allocated %lld\n"
+			  "handles_released %lld\n"
+			  "program_cmds %lld\n"
+			  "program_deferred %lld\n"
+			  "program_errors %lld\n"
+			  "clear_cmds %lld\n"
+			  "clear_errors %lld\n"
+			  "physical_clears %lld\n"
+			  "pasid_teardown_clears %lld\n"
+			  "all_teardown_clears %lld\n"
+			  "irq_requests %lld\n"
+			  "irq_frees %lld\n"
+			  "signals %lld\n"
+			  "pending_signals %lld\n"
+			  "pending_flushes %lld\n"
+			  "revoke_cmds %lld\n"
+			  "revoke_errors %lld\n"
+			  "revoked_vectors %lld\n"
+			  "revoked_reprograms %lld\n"
+			  "assertion_failures %lld\n"
+			  "selftest_runs %lld\n"
+			  "selftest_failures %lld\n",
+			  (long long)atomic64_read(&stats->request_cmds),
+			  (long long)atomic64_read(&stats->request_errors),
+			  (long long)atomic64_read(&stats->request_vector0_rejects),
+			  (long long)atomic64_read(&stats->duplicate_requests),
+			  (long long)atomic64_read(&stats->release_cmds),
+			  (long long)atomic64_read(&stats->release_errors),
+			  (long long)atomic64_read(&stats->release_unallocated),
+			  (long long)atomic64_read(&stats->handles_allocated),
+			  (long long)atomic64_read(&stats->handles_released),
+			  (long long)atomic64_read(&stats->program_cmds),
+			  (long long)atomic64_read(&stats->program_deferred),
+			  (long long)atomic64_read(&stats->program_errors),
+			  (long long)atomic64_read(&stats->clear_cmds),
+			  (long long)atomic64_read(&stats->clear_errors),
+			  (long long)atomic64_read(&stats->physical_clears),
+			  (long long)atomic64_read(&stats->pasid_teardown_clears),
+			  (long long)atomic64_read(&stats->all_teardown_clears),
+			  (long long)atomic64_read(&stats->irq_requests),
+			  (long long)atomic64_read(&stats->irq_frees),
+			  (long long)atomic64_read(&stats->signals),
+			  (long long)atomic64_read(&stats->pending_signals),
+			  (long long)atomic64_read(&stats->pending_flushes),
+			  (long long)atomic64_read(&stats->revoke_cmds),
+			  (long long)atomic64_read(&stats->revoke_errors),
+			  (long long)atomic64_read(&stats->revoked_vectors),
+			  (long long)atomic64_read(&stats->revoked_reprograms),
+			  (long long)atomic64_read(&stats->assertion_failures),
+			  (long long)atomic64_read(&stats->selftest_runs),
+			  (long long)atomic64_read(&stats->selftest_failures));
+}
+static DEVICE_ATTR_RO(ims_stats);
+static struct device_attribute dev_attr_ims_lifecycle_stats =
+	__ATTR(ims_lifecycle_stats, 0444, ims_stats_show, NULL);
+
+static ssize_t ims_stats_reset_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct idxd_vfio_device *vfio_dev = dev_get_drvdata(dev);
+	bool reset;
+	int rc;
+
+	if (!vfio_dev)
+		return -ENODEV;
+
+	rc = kstrtobool(buf, &reset);
+	if (rc)
+		return rc;
+
+	if (reset)
+		idxd_vfio_reset_ims_stats(vfio_dev);
+
+	return count;
+}
+static DEVICE_ATTR_WO(ims_stats_reset);
+static struct device_attribute dev_attr_ims_lifecycle_stats_reset =
+	__ATTR(ims_lifecycle_stats_reset, 0200, NULL, ims_stats_reset_store);
+
+static ssize_t ims_selftest_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct idxd_vfio_device *vfio_dev = dev_get_drvdata(dev);
+	bool run;
+	int rc;
+
+	if (!vfio_dev)
+		return -ENODEV;
+
+	rc = kstrtobool(buf, &run);
+	if (rc)
+		return rc;
+	if (!run)
+		return count;
+
+	rc = idxd_vfio_run_ims_selftest(vfio_dev);
+	if (rc)
+		return rc;
+
+	return count;
+}
+static DEVICE_ATTR_WO(ims_selftest);
+static struct device_attribute dev_attr_ims_lifecycle_selftest =
+	__ATTR(ims_lifecycle_selftest, 0200, NULL, ims_selftest_store);
+
+static ssize_t ims_revoke_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct idxd_vfio_device *vfio_dev = dev_get_drvdata(dev);
+	bool revoke;
+	int rc;
+
+	if (!vfio_dev)
+		return -ENODEV;
+
+	rc = kstrtobool(buf, &revoke);
+	if (rc)
+		return rc;
+	if (!revoke)
+		return count;
+
+	rc = idxd_vfio_revoke_ims_handles(vfio_dev,
+					  VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_VECTOR_ALL);
+	if (rc)
+		return rc;
+
+	return count;
+}
+static DEVICE_ATTR_WO(ims_revoke);
+static struct device_attribute dev_attr_ims_revoke_handles =
+	__ATTR(ims_revoke_handles, 0200, NULL, ims_revoke_store);
 
 static ssize_t bar2_trap_stats_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
@@ -323,39 +591,41 @@ static ssize_t bar2_force_unlimited_retries_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(bar2_force_unlimited_retries);
 
+static struct attribute *idxd_vfio_attrs[] = {
+	&dev_attr_bar2_trap_stats.attr,
+	&dev_attr_bar2_trap_stats_reset.attr,
+	&dev_attr_bar2_force_unlimited_retries.attr,
+	&dev_attr_ims_stats.attr,
+	&dev_attr_ims_stats_reset.attr,
+	&dev_attr_ims_selftest.attr,
+	&dev_attr_ims_revoke.attr,
+	/*
+	 * Compatibility aliases for existing test scripts. New scripts should
+	 * use ims_stats, ims_stats_reset, ims_selftest, and ims_revoke.
+	 */
+	&dev_attr_ims_lifecycle_stats.attr,
+	&dev_attr_ims_lifecycle_stats_reset.attr,
+	&dev_attr_ims_lifecycle_selftest.attr,
+	&dev_attr_ims_revoke_handles.attr,
+	NULL,
+};
+
+static const struct attribute_group idxd_vfio_attr_group = {
+	.attrs = idxd_vfio_attrs,
+};
+
 static int idxd_vfio_create_sysfs(struct idxd_vfio_device *vfio_dev)
 {
 	struct device *dev = vdev_confdev(vfio_dev->ivdev);
-	int rc;
 
-	rc = device_create_file(dev, &dev_attr_bar2_trap_stats);
-	if (rc)
-		return rc;
-
-	rc = device_create_file(dev, &dev_attr_bar2_trap_stats_reset);
-	if (rc)
-		goto err_stats;
-
-	rc = device_create_file(dev, &dev_attr_bar2_force_unlimited_retries);
-	if (rc)
-		goto err_reset;
-
-	return rc;
-
-err_reset:
-	device_remove_file(dev, &dev_attr_bar2_trap_stats_reset);
-err_stats:
-	device_remove_file(dev, &dev_attr_bar2_trap_stats);
-	return rc;
+	return sysfs_create_group(&dev->kobj, &idxd_vfio_attr_group);
 }
 
 static void idxd_vfio_remove_sysfs(struct idxd_vfio_device *vfio_dev)
 {
 	struct device *dev = vdev_confdev(vfio_dev->ivdev);
 
-	device_remove_file(dev, &dev_attr_bar2_force_unlimited_retries);
-	device_remove_file(dev, &dev_attr_bar2_trap_stats_reset);
-	device_remove_file(dev, &dev_attr_bar2_trap_stats);
+	sysfs_remove_group(&dev->kobj, &idxd_vfio_attr_group);
 }
 
 static unsigned int idxd_vfio_msix_count(struct idxd_vfio_device *vfio_dev)
@@ -367,6 +637,418 @@ static u32 idxd_vfio_msix_pba_offset(struct idxd_vfio_device *vfio_dev)
 {
 	return ALIGN(IDXD_VDEV_MSIX_TABLE_OFFSET +
 		     idxd_vfio_msix_count(vfio_dev) * PCI_MSIX_ENTRY_SIZE, 8);
+}
+
+static u32 idxd_vfio_msix_pba_size(struct idxd_vfio_device *vfio_dev)
+{
+	return BITS_TO_LONGS(idxd_vfio_msix_count(vfio_dev)) * sizeof(unsigned long);
+}
+
+static u16 idxd_vfio_msix_flags(struct idxd_vfio_device *vfio_dev)
+{
+	return vfio_dev->config[IDXD_VDEV_MSIX_CAP_OFFSET + PCI_MSIX_FLAGS] |
+	       (vfio_dev->config[IDXD_VDEV_MSIX_CAP_OFFSET + PCI_MSIX_FLAGS + 1] << 8);
+}
+
+static bool idxd_vfio_msix_masked_locked(struct idxd_vfio_device *vfio_dev,
+					 unsigned int vector)
+{
+	struct idxd_vfio_msix_entry *entry = &vfio_dev->msix_entries[vector];
+
+	lockdep_assert_held(&vfio_dev->irq_lock);
+
+	return !(idxd_vfio_msix_flags(vfio_dev) & PCI_MSIX_FLAGS_ENABLE) ||
+	       (idxd_vfio_msix_flags(vfio_dev) & PCI_MSIX_FLAGS_MASKALL) ||
+	       (entry->vector_ctrl & PCI_MSIX_ENTRY_CTRL_MASKBIT);
+}
+
+static bool idxd_vfio_ims_supported(struct idxd_device *idxd)
+{
+	return idxd->hw.gen_cap.max_ims_mult && idxd->ims_offset;
+}
+
+static bool idxd_vfio_msix_vector_uses_ims(unsigned int vector)
+{
+	/*
+	 * Vector 0 is the VDEV command/error vector. Descriptor completion
+	 * vectors start at 1 and are backed by physical IMS entries.
+	 */
+	return vector != 0;
+}
+
+static void __iomem *idxd_vfio_ims_entry_addr(struct idxd_device *idxd,
+					      unsigned int index,
+					      unsigned int offset)
+{
+	return idxd->reg_base + idxd->ims_offset +
+	       index * IDXD_VFIO_IMS_ENTRY_SIZE + offset;
+}
+
+static u32 idxd_vfio_ims_entry_ctrl(struct idxd_vfio_msix_entry *entry)
+{
+	u32 ctrl = 0;
+
+	if (entry->vector_ctrl & PCI_MSIX_ENTRY_CTRL_MASKBIT)
+		ctrl |= IDXD_VFIO_IMS_CTRL_MASK;
+	if (entry->ims_ignore)
+		ctrl |= IDXD_VFIO_IMS_CTRL_IGNORE;
+	if (entry->ims_programmed) {
+		ctrl |= IDXD_VFIO_IMS_CTRL_PASID_EN;
+		ctrl |= (entry->host_pasid << IDXD_VFIO_IMS_CTRL_PASID_SHIFT) &
+			IDXD_VFIO_IMS_CTRL_PASID_MASK;
+	}
+
+	return ctrl;
+}
+
+static irqreturn_t idxd_vfio_ims_irq_thread(int irq, void *data)
+{
+	struct idxd_vfio_msix_entry *entry = data;
+
+	idxd_vfio_msix_signal(entry->vfio_dev, entry->vector);
+	return IRQ_HANDLED;
+}
+
+static int idxd_vfio_request_ims_irq_locked(struct idxd_vfio_device *vfio_dev,
+					    struct idxd_vfio_msix_entry *entry)
+{
+	struct idxd_device *idxd = vfio_dev->ivdev->idxd;
+	struct device *dev = vdev_confdev(vfio_dev->ivdev);
+	int irq, rc;
+
+	lockdep_assert_held(&vfio_dev->irq_lock);
+
+	if (!idxd_vfio_msix_vector_uses_ims(entry->vector) ||
+	    entry->host_irq_requested)
+		return 0;
+	if (entry->host_msix_vector >= idxd->irq_cnt)
+		return -ENOSPC;
+
+	irq = pci_irq_vector(idxd->pdev, entry->host_msix_vector);
+	if (irq < 0)
+		return irq;
+
+	rc = request_threaded_irq(irq, NULL, idxd_vfio_ims_irq_thread, 0,
+				  "idxd-vfio-ims", entry);
+	if (rc) {
+		dev_err(dev, "failed to request IMS host IRQ for vector %u host vector %u: %d\n",
+			entry->vector, entry->host_msix_vector, rc);
+		return rc;
+	}
+
+	entry->host_irq = irq;
+	entry->host_irq_requested = true;
+	atomic64_inc(&vfio_dev->ims_stats.irq_requests);
+	return 0;
+}
+
+static void idxd_vfio_free_ims_irq(struct idxd_vfio_msix_entry *entry)
+{
+	if (!entry->host_irq_requested)
+		return;
+
+	free_irq(entry->host_irq, entry);
+	entry->host_irq = -1;
+	entry->host_irq_requested = false;
+	atomic64_inc(&entry->vfio_dev->ims_stats.irq_frees);
+}
+
+static void idxd_vfio_get_ims_msg(struct idxd_vfio_msix_entry *entry,
+				  u64 *msg_addr, u32 *msg_data)
+{
+	if (entry->host_irq_requested) {
+		struct msi_msg msg;
+
+		get_cached_msi_msg(entry->host_irq, &msg);
+		*msg_addr = ((u64)msg.address_hi << 32) | msg.address_lo;
+		*msg_data = msg.data;
+		return;
+	}
+
+	*msg_addr = ((u64)entry->msg_addr_hi << 32) | entry->msg_addr_lo;
+	*msg_data = entry->msg_data;
+}
+
+static void idxd_vfio_write_ims_entry(struct idxd_vfio_device *vfio_dev,
+				      struct idxd_vfio_msix_entry *entry)
+{
+	struct idxd_device *idxd = vfio_dev->ivdev->idxd;
+	u32 ctrl = idxd_vfio_ims_entry_ctrl(entry);
+	u32 msg_data;
+	u64 msg_addr;
+	unsigned long flags;
+
+	if (!entry->ims_allocated)
+		return;
+
+	idxd_vfio_get_ims_msg(entry, &msg_addr, &msg_data);
+
+	spin_lock_irqsave(&idxd->dev_lock, flags);
+	iowrite32(lower_32_bits(msg_addr),
+		  idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+					   IDXD_VFIO_IMS_MSG_ADDR));
+	iowrite32(upper_32_bits(msg_addr),
+		  idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+					   IDXD_VFIO_IMS_MSG_ADDR + sizeof(u32)));
+	iowrite32(msg_data,
+		  idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+					   IDXD_VFIO_IMS_MSG_DATA));
+	iowrite32(ctrl, idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+						 IDXD_VFIO_IMS_CTRL));
+	spin_unlock_irqrestore(&idxd->dev_lock, flags);
+}
+
+static void idxd_vfio_clear_ims_entry_hw(struct idxd_vfio_device *vfio_dev,
+					 struct idxd_vfio_msix_entry *entry)
+{
+	struct idxd_device *idxd = vfio_dev->ivdev->idxd;
+	unsigned long flags;
+
+	if (!entry->ims_allocated)
+		return;
+
+	atomic64_inc(&vfio_dev->ims_stats.physical_clears);
+	spin_lock_irqsave(&idxd->dev_lock, flags);
+	iowrite32(IDXD_VFIO_IMS_CTRL_MASK | IDXD_VFIO_IMS_CTRL_IGNORE,
+		  idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+					   IDXD_VFIO_IMS_CTRL));
+	iowrite32(0, idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+					      IDXD_VFIO_IMS_MSG_ADDR));
+	iowrite32(0, idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+					      IDXD_VFIO_IMS_MSG_ADDR +
+					      sizeof(u32)));
+	iowrite32(0, idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+					      IDXD_VFIO_IMS_MSG_DATA));
+	spin_unlock_irqrestore(&idxd->dev_lock, flags);
+}
+
+static void idxd_vfio_forget_ims_handle(struct idxd_vfio_msix_entry *entry)
+{
+	entry->ims_allocated = false;
+	entry->ims_index = UINT_MAX;
+	entry->ims_handle = INVALID_INT_HANDLE;
+	entry->host_msix_vector = UINT_MAX;
+}
+
+static void idxd_vfio_clear_ims_entry(struct idxd_vfio_device *vfio_dev,
+				      struct idxd_vfio_msix_entry *entry)
+{
+	entry->ims_configured = false;
+	entry->ims_programmed = false;
+	entry->ims_ignore = true;
+	entry->host_pasid = IOMMU_PASID_INVALID;
+	entry->msg_addr_lo = 0;
+	entry->msg_addr_hi = 0;
+	entry->msg_data = 0;
+	entry->vector_ctrl |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
+	entry->pending = false;
+	entry->ims_revoked = false;
+
+	idxd_vfio_clear_ims_entry_hw(vfio_dev, entry);
+}
+
+static void idxd_vfio_read_ims_entry_hw(struct idxd_vfio_device *vfio_dev,
+					struct idxd_vfio_msix_entry *entry,
+					u64 *msg_addr, u32 *msg_data,
+					u32 *ctrl)
+{
+	struct idxd_device *idxd = vfio_dev->ivdev->idxd;
+	unsigned long flags;
+
+	*msg_addr = 0;
+	*msg_data = 0;
+	*ctrl = 0;
+
+	if (!entry->ims_allocated)
+		return;
+
+	spin_lock_irqsave(&idxd->dev_lock, flags);
+	*msg_addr =
+		ioread32(idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+						  IDXD_VFIO_IMS_MSG_ADDR));
+	*msg_addr |=
+		(u64)ioread32(idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+						       IDXD_VFIO_IMS_MSG_ADDR +
+						       sizeof(u32))) << 32;
+	*msg_data = ioread32(idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+						      IDXD_VFIO_IMS_MSG_DATA));
+	*ctrl = ioread32(idxd_vfio_ims_entry_addr(idxd, entry->ims_index,
+						  IDXD_VFIO_IMS_CTRL));
+	spin_unlock_irqrestore(&idxd->dev_lock, flags);
+}
+
+static u32 idxd_vfio_read_ims_entry_ctrl(struct idxd_vfio_device *vfio_dev,
+					 struct idxd_vfio_msix_entry *entry)
+{
+	u64 msg_addr;
+	u32 msg_data, ctrl;
+
+	idxd_vfio_read_ims_entry_hw(vfio_dev, entry, &msg_addr, &msg_data,
+				    &ctrl);
+
+	return ctrl;
+}
+
+static bool
+idxd_vfio_assert_ims_entry_clear_locked(struct idxd_vfio_device *vfio_dev,
+					struct idxd_vfio_msix_entry *entry,
+					const char *reason,
+					bool require_irq_free,
+					bool require_handle_free)
+{
+	struct device *dev = vdev_confdev(vfio_dev->ivdev);
+	bool ok = true;
+	u64 msg_addr;
+	u32 msg_data, ctrl;
+
+	lockdep_assert_held(&vfio_dev->irq_lock);
+
+	if (entry->ims_programmed ||
+	    entry->ims_configured ||
+	    entry->host_pasid != IOMMU_PASID_INVALID ||
+	    !entry->ims_ignore ||
+	    entry->pending ||
+	    entry->ims_revoked)
+		ok = false;
+
+	if (require_irq_free && entry->host_irq_requested)
+		ok = false;
+
+	if (require_handle_free &&
+	    (entry->ims_allocated ||
+	     entry->ims_index != UINT_MAX ||
+	     entry->ims_handle != INVALID_INT_HANDLE ||
+	     entry->host_msix_vector != UINT_MAX))
+		ok = false;
+
+	idxd_vfio_read_ims_entry_hw(vfio_dev, entry, &msg_addr, &msg_data,
+				    &ctrl);
+	if (entry->ims_allocated &&
+	    ((ctrl & IDXD_VFIO_IMS_CTRL_PASID_EN) ||
+	     !(ctrl & IDXD_VFIO_IMS_CTRL_MASK) ||
+	     !(ctrl & IDXD_VFIO_IMS_CTRL_IGNORE)))
+		ok = false;
+
+	if (!ok) {
+		atomic64_inc(&vfio_dev->ims_stats.assertion_failures);
+		dev_warn(dev,
+			 "IMS state assertion failed during %s: vector=%u allocated=%u configured=%u programmed=%u irq_requested=%u handle=%d ims_index=%u host_vector=%u host_pasid=%u pending=%u ignore=%u revoked=%u ctrl=%#x msg=%#llx/%#x\n",
+			 reason, entry->vector, entry->ims_allocated,
+			 entry->ims_configured, entry->ims_programmed,
+			 entry->host_irq_requested, entry->ims_handle,
+			 entry->ims_index, entry->host_msix_vector,
+			 entry->host_pasid, entry->pending, entry->ims_ignore,
+			 entry->ims_revoked, ctrl,
+			 (unsigned long long)msg_addr, msg_data);
+	}
+
+	return ok;
+}
+
+static bool idxd_vfio_assert_ims_entry_clear(struct idxd_vfio_device *vfio_dev,
+					     struct idxd_vfio_msix_entry *entry,
+					     const char *reason,
+					     bool require_irq_free,
+					     bool require_handle_free)
+{
+	bool ok;
+
+	mutex_lock(&vfio_dev->irq_lock);
+	ok = idxd_vfio_assert_ims_entry_clear_locked(vfio_dev, entry, reason,
+						    require_irq_free,
+						    require_handle_free);
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	return ok;
+}
+
+static void idxd_vfio_assert_all_ims_clear(struct idxd_vfio_device *vfio_dev,
+					   const char *reason,
+					   bool require_irq_free)
+{
+	unsigned int i;
+
+	mutex_lock(&vfio_dev->irq_lock);
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++)
+		idxd_vfio_assert_ims_entry_clear_locked(vfio_dev,
+							&vfio_dev->msix_entries[i],
+							reason,
+							require_irq_free,
+							false);
+	mutex_unlock(&vfio_dev->irq_lock);
+}
+
+static void idxd_vfio_assert_no_ims_for_pasid(struct idxd_vfio_device *vfio_dev,
+					      ioasid_t host_pasid,
+					      const char *reason)
+{
+	struct device *dev = vdev_confdev(vfio_dev->ivdev);
+	unsigned int i;
+
+	mutex_lock(&vfio_dev->irq_lock);
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		struct idxd_vfio_msix_entry *entry = &vfio_dev->msix_entries[i];
+
+		if (entry->host_pasid != host_pasid ||
+		    (!entry->ims_configured && !entry->ims_programmed &&
+		     !entry->ims_revoked))
+			continue;
+
+		atomic64_inc(&vfio_dev->ims_stats.assertion_failures);
+		dev_warn(dev,
+			 "IMS PASID teardown assertion failed during %s: vector=%u still references PASID %u configured=%u programmed=%u revoked=%u\n",
+			 reason, i, host_pasid, entry->ims_configured,
+			 entry->ims_programmed, entry->ims_revoked);
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+}
+
+static void idxd_vfio_clear_ims_entries_for_pasid(struct idxd_vfio_device *vfio_dev,
+						  ioasid_t host_pasid)
+{
+	unsigned int i;
+
+	mutex_lock(&vfio_dev->irq_lock);
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		struct idxd_vfio_msix_entry *entry = &vfio_dev->msix_entries[i];
+
+		if (entry->host_pasid != host_pasid ||
+		    (!entry->ims_configured && !entry->ims_programmed &&
+		     !entry->ims_revoked))
+			continue;
+
+		idxd_vfio_clear_ims_entry(vfio_dev, entry);
+		atomic64_inc(&vfio_dev->ims_stats.pasid_teardown_clears);
+		entry->pending = false;
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+}
+
+static void idxd_vfio_clear_all_ims_entries(struct idxd_vfio_device *vfio_dev)
+{
+	unsigned int i;
+
+	mutex_lock(&vfio_dev->irq_lock);
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		idxd_vfio_clear_ims_entry(vfio_dev, &vfio_dev->msix_entries[i]);
+		atomic64_inc(&vfio_dev->ims_stats.all_teardown_clears);
+		vfio_dev->msix_entries[i].pending = false;
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+}
+
+static void idxd_vfio_free_unused_ims_irqs(struct idxd_vfio_device *vfio_dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		struct idxd_vfio_msix_entry *entry = &vfio_dev->msix_entries[i];
+
+		if (!entry->host_irq_requested || entry->ims_programmed)
+			continue;
+
+		idxd_vfio_free_ims_irq(entry);
+	}
 }
 
 static size_t idxd_vfio_bar2_size(struct idxd_vfio_device *vfio_dev)
@@ -682,6 +1364,88 @@ static bool idxd_vfio_grpcfg_readb(struct idxd_vfio_device *vfio_dev,
 	return true;
 }
 
+static bool idxd_vfio_msix_table_readb(struct idxd_vfio_device *vfio_dev,
+				       loff_t pos, u8 *val)
+{
+	struct idxd_vfio_msix_entry *entry;
+	u32 table_size, offset, field;
+	unsigned int vector;
+	u32 value;
+
+	table_size = idxd_vfio_msix_count(vfio_dev) * PCI_MSIX_ENTRY_SIZE;
+	if (pos < IDXD_VDEV_MSIX_TABLE_OFFSET ||
+	    pos >= IDXD_VDEV_MSIX_TABLE_OFFSET + table_size)
+		return false;
+
+	offset = pos - IDXD_VDEV_MSIX_TABLE_OFFSET;
+	vector = offset / PCI_MSIX_ENTRY_SIZE;
+	field = offset % PCI_MSIX_ENTRY_SIZE;
+	entry = &vfio_dev->msix_entries[vector];
+
+	switch (field & ~0x3U) {
+	case PCI_MSIX_ENTRY_LOWER_ADDR:
+		value = entry->msg_addr_lo;
+		break;
+	case PCI_MSIX_ENTRY_UPPER_ADDR:
+		value = entry->msg_addr_hi;
+		break;
+	case PCI_MSIX_ENTRY_DATA:
+		value = entry->msg_data;
+		break;
+	case PCI_MSIX_ENTRY_VECTOR_CTRL:
+		value = entry->vector_ctrl;
+		break;
+	default:
+		value = 0;
+		break;
+	}
+
+	*val = value >> ((field & 0x3) * 8);
+	return true;
+}
+
+static bool idxd_vfio_msix_pba_readb(struct idxd_vfio_device *vfio_dev,
+				     loff_t pos, u8 *val)
+{
+	u32 pba_offset = idxd_vfio_msix_pba_offset(vfio_dev);
+	u32 pba_size = idxd_vfio_msix_pba_size(vfio_dev);
+	unsigned int vector;
+	u32 offset;
+	u8 value = 0;
+
+	if (pos < pba_offset || pos >= pba_offset + pba_size)
+		return false;
+
+	offset = pos - pba_offset;
+	for (vector = offset * BITS_PER_BYTE;
+	     vector < min_t(unsigned int, idxd_vfio_msix_count(vfio_dev),
+			    (offset + 1) * BITS_PER_BYTE);
+	     vector++) {
+		struct idxd_vfio_msix_entry *entry =
+			&vfio_dev->msix_entries[vector];
+		u32 ctrl = idxd_vfio_read_ims_entry_ctrl(vfio_dev, entry);
+
+		if (entry->pending || (ctrl & IDXD_VFIO_IMS_CTRL_PENDING))
+			value |= BIT(vector - offset * BITS_PER_BYTE);
+	}
+
+	*val = value;
+	return true;
+}
+
+static bool idxd_vfio_msix_readb(struct idxd_vfio_device *vfio_dev,
+				 loff_t pos, u8 *val)
+{
+	bool handled;
+
+	mutex_lock(&vfio_dev->irq_lock);
+	handled = idxd_vfio_msix_table_readb(vfio_dev, pos, val) ||
+		  idxd_vfio_msix_pba_readb(vfio_dev, pos, val);
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	return handled;
+}
+
 static u64 idxd_vfio_bar0_readq(struct idxd_vfio_device *vfio_dev, loff_t pos)
 {
 	struct idxd_vdev *ivdev = vfio_dev->ivdev;
@@ -743,6 +1507,9 @@ static u8 idxd_vfio_bar0_readb(struct idxd_vfio_device *vfio_dev, loff_t pos)
 {
 	u64 val;
 	u8 byte;
+
+	if (idxd_vfio_msix_readb(vfio_dev, pos, &byte))
+		return byte;
 
 	if (idxd_vfio_wqcfg_readb(vfio_dev, pos, &byte))
 		return byte;
@@ -810,6 +1577,8 @@ static void idxd_vfio_init_grpcfg(struct idxd_vfio_device *vfio_dev)
 
 static void idxd_vfio_reset_bar0(struct idxd_vfio_device *vfio_dev)
 {
+	unsigned int i;
+
 	vfio_dev->state = IDXD_DEVICE_STATE_DISABLED;
 	vfio_dev->genctrl = 0;
 	vfio_dev->gencfg = 0;
@@ -821,6 +1590,52 @@ static void idxd_vfio_reset_bar0(struct idxd_vfio_device *vfio_dev)
 	bitmap_zero(vfio_dev->wq_enable_map, vfio_dev->ivdev->num_wqs);
 	idxd_vfio_init_wqcfg(vfio_dev);
 	idxd_vfio_init_grpcfg(vfio_dev);
+
+	mutex_lock(&vfio_dev->irq_lock);
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		vfio_dev->msix_entries[i].msg_addr_lo = 0;
+		vfio_dev->msix_entries[i].msg_addr_hi = 0;
+		vfio_dev->msix_entries[i].msg_data = 0;
+		vfio_dev->msix_entries[i].vector_ctrl =
+			PCI_MSIX_ENTRY_CTRL_MASKBIT;
+		idxd_vfio_clear_ims_entry(vfio_dev, &vfio_dev->msix_entries[i]);
+		vfio_dev->msix_entries[i].pending = false;
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+}
+
+static void idxd_vfio_msix_flush_pending_locked(struct idxd_vfio_device *vfio_dev,
+						unsigned int vector)
+{
+	struct idxd_vfio_msix_entry *entry;
+	struct eventfd_ctx *trigger;
+
+	lockdep_assert_held(&vfio_dev->irq_lock);
+
+	if (vector >= idxd_vfio_msix_count(vfio_dev))
+		return;
+
+	entry = &vfio_dev->msix_entries[vector];
+	if (!entry->pending || idxd_vfio_msix_masked_locked(vfio_dev, vector))
+		return;
+
+	trigger = vfio_dev->msix_trigger[vector];
+	if (!trigger)
+		return;
+
+	entry->pending = false;
+	atomic64_inc(&vfio_dev->ims_stats.pending_flushes);
+	eventfd_signal(trigger);
+}
+
+static void idxd_vfio_msix_flush_all_pending(struct idxd_vfio_device *vfio_dev)
+{
+	unsigned int i;
+
+	mutex_lock(&vfio_dev->irq_lock);
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++)
+		idxd_vfio_msix_flush_pending_locked(vfio_dev, i);
+	mutex_unlock(&vfio_dev->irq_lock);
 }
 
 static int idxd_vfio_msix_set_vector_signal(struct idxd_vfio_device *vfio_dev,
@@ -841,6 +1656,7 @@ static int idxd_vfio_msix_set_vector_signal(struct idxd_vfio_device *vfio_dev,
 	mutex_lock(&vfio_dev->irq_lock);
 	old = vfio_dev->msix_trigger[vector];
 	vfio_dev->msix_trigger[vector] = trigger;
+	idxd_vfio_msix_flush_pending_locked(vfio_dev, vector);
 	mutex_unlock(&vfio_dev->irq_lock);
 
 	if (old)
@@ -880,25 +1696,36 @@ static void idxd_vfio_msix_disable(struct idxd_vfio_device *vfio_dev)
 static void idxd_vfio_msix_signal(struct idxd_vfio_device *vfio_dev,
 				  unsigned int vector)
 {
+	struct idxd_vfio_msix_entry *entry;
 	struct eventfd_ctx *trigger;
 
 	if (vector >= idxd_vfio_msix_count(vfio_dev))
 		return;
 
 	mutex_lock(&vfio_dev->irq_lock);
+	entry = &vfio_dev->msix_entries[vector];
+	atomic64_inc(&vfio_dev->ims_stats.signals);
+	if (idxd_vfio_msix_masked_locked(vfio_dev, vector)) {
+		entry->pending = true;
+		atomic64_inc(&vfio_dev->ims_stats.pending_signals);
+		mutex_unlock(&vfio_dev->irq_lock);
+		return;
+	}
+
 	trigger = vfio_dev->msix_trigger[vector];
-	if (trigger)
+	if (trigger) {
+		entry->pending = false;
 		eventfd_signal(trigger);
+	} else {
+		entry->pending = true;
+		atomic64_inc(&vfio_dev->ims_stats.pending_signals);
+	}
 	mutex_unlock(&vfio_dev->irq_lock);
 }
 
 static u32 idxd_vfio_cmdsts(u8 err, u16 result)
 {
-	union cmdsts_reg cmdsts = {};
-
-	cmdsts.err = err;
-	cmdsts.result = result;
-	return cmdsts.bits;
+	return err | ((u32)result << IDXD_CMDSTS_RES_SHIFT);
 }
 
 static void idxd_vfio_complete_cmd(struct idxd_vfio_device *vfio_dev,
@@ -957,6 +1784,80 @@ static bool idxd_vfio_lookup_host_pasid(struct idxd_vfio_device *vfio_dev,
 	mutex_unlock(&vfio_dev->pasid_lock);
 
 	return found;
+}
+
+static int idxd_vfio_try_program_ims_locked(struct idxd_vfio_device *vfio_dev,
+					    struct idxd_vfio_msix_entry *entry,
+					    bool *deferred)
+{
+	bool attached;
+	int rc;
+
+	lockdep_assert_held(&vfio_dev->irq_lock);
+
+	if (deferred)
+		*deferred = false;
+
+	if (!idxd_vfio_msix_vector_uses_ims(entry->vector) ||
+	    !entry->ims_configured)
+		return 0;
+
+	if (!entry->ims_allocated) {
+		if (deferred)
+			*deferred = true;
+		return 0;
+	}
+
+	if (!idxd_vfio_valid_pasid(entry->host_pasid))
+		return -EINVAL;
+
+	mutex_lock(&vfio_dev->pasid_lock);
+	attached = idxd_vfio_host_pasid_attached_locked(vfio_dev,
+							entry->host_pasid);
+	mutex_unlock(&vfio_dev->pasid_lock);
+	if (!attached) {
+		if (deferred)
+			*deferred = true;
+		return 0;
+	}
+
+	if (!entry->ims_programmed) {
+		rc = idxd_vfio_request_ims_irq_locked(vfio_dev, entry);
+		if (rc)
+			return rc;
+		entry->ims_programmed = true;
+	}
+
+	idxd_vfio_write_ims_entry(vfio_dev, entry);
+	return 0;
+}
+
+static int idxd_vfio_program_pending_ims_for_pasid(struct idxd_vfio_device *vfio_dev,
+						   ioasid_t host_pasid)
+{
+	unsigned int i;
+	int first_rc = 0;
+
+	mutex_lock(&vfio_dev->irq_lock);
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		struct idxd_vfio_msix_entry *entry = &vfio_dev->msix_entries[i];
+		int rc;
+
+		if (entry->host_pasid != host_pasid || !entry->ims_configured ||
+		    entry->ims_programmed)
+			continue;
+
+		rc = idxd_vfio_try_program_ims_locked(vfio_dev, entry, NULL);
+		if (!rc)
+			continue;
+
+		atomic64_inc(&vfio_dev->ims_stats.program_errors);
+		if (!first_rc)
+			first_rc = rc;
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	return first_rc;
 }
 
 static void idxd_vfio_write_wqcfg(struct idxd_wq *wq)
@@ -1451,10 +2352,445 @@ static u8 idxd_vfio_check_wq_mask(struct idxd_vfio_device *vfio_dev, u32 operand
 	return IDXD_CMDSTS_SUCCESS;
 }
 
+static u8 idxd_vfio_request_int_handle(struct idxd_vfio_device *vfio_dev,
+				       u32 operand, u16 *result)
+{
+	struct idxd_device *idxd = vfio_dev->ivdev->idxd;
+	struct idxd_vfio_msix_entry *entry;
+	unsigned int vector = operand & GENMASK(15, 0);
+	bool was_revoked, reprogram;
+	int handle, rc;
+
+	atomic64_inc(&vfio_dev->ims_stats.request_cmds);
+
+	if (vector >= idxd_vfio_msix_count(vfio_dev)) {
+		atomic64_inc(&vfio_dev->ims_stats.request_errors);
+		return IDXD_CMDSTS_ERR_INVAL_INT_IDX;
+	}
+	if (!idxd_vfio_msix_vector_uses_ims(vector)) {
+		atomic64_inc(&vfio_dev->ims_stats.request_errors);
+		atomic64_inc(&vfio_dev->ims_stats.request_vector0_rejects);
+		return IDXD_CMDSTS_ERR_INVAL_INT_IDX;
+	}
+	if (!idxd_vfio_ims_supported(idxd) || vector >= idxd->irq_cnt) {
+		atomic64_inc(&vfio_dev->ims_stats.request_errors);
+		return IDXD_CMDSTS_ERR_NO_HANDLE;
+	}
+
+	entry = &vfio_dev->msix_entries[vector];
+
+	mutex_lock(&vfio_dev->irq_lock);
+	if (entry->ims_allocated) {
+		*result = entry->ims_handle;
+		atomic64_inc(&vfio_dev->ims_stats.duplicate_requests);
+		mutex_unlock(&vfio_dev->irq_lock);
+		return IDXD_CMDSTS_SUCCESS;
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	if (idxd->request_int_handles) {
+		rc = idxd_device_request_int_handle(idxd, vector, &handle,
+						    IDXD_IRQ_IMS);
+		if (rc) {
+			atomic64_inc(&vfio_dev->ims_stats.request_errors);
+			return IDXD_CMDSTS_ERR_NO_HANDLE;
+		}
+	} else {
+		handle = vector;
+	}
+
+	mutex_lock(&vfio_dev->irq_lock);
+	if (entry->ims_allocated) {
+		*result = entry->ims_handle;
+		atomic64_inc(&vfio_dev->ims_stats.duplicate_requests);
+		mutex_unlock(&vfio_dev->irq_lock);
+		if (idxd->request_int_handles)
+			idxd_device_release_int_handle(idxd, handle,
+						       IDXD_IRQ_IMS);
+		return IDXD_CMDSTS_SUCCESS;
+	}
+
+	was_revoked = entry->ims_revoked;
+	reprogram = was_revoked && entry->ims_configured;
+	entry->ims_handle = handle;
+	entry->ims_index = handle;
+	entry->host_msix_vector = vector;
+	entry->ims_allocated = true;
+	entry->ims_revoked = false;
+	if (reprogram) {
+		bool deferred = false;
+
+		rc = idxd_vfio_try_program_ims_locked(vfio_dev, entry,
+						      &deferred);
+		if (rc) {
+			idxd_vfio_forget_ims_handle(entry);
+			entry->ims_revoked = true;
+			mutex_unlock(&vfio_dev->irq_lock);
+			if (idxd->request_int_handles)
+				idxd_device_release_int_handle(idxd, handle,
+							       IDXD_IRQ_IMS);
+			atomic64_inc(&vfio_dev->ims_stats.request_errors);
+			return IDXD_CMDSTS_ERR_NO_HANDLE;
+		}
+		if (deferred)
+			atomic64_inc(&vfio_dev->ims_stats.program_deferred);
+		else
+			atomic64_inc(&vfio_dev->ims_stats.revoked_reprograms);
+	} else {
+		idxd_vfio_clear_ims_entry(vfio_dev, entry);
+	}
+	atomic64_inc(&vfio_dev->ims_stats.handles_allocated);
+	*result = handle;
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	return IDXD_CMDSTS_SUCCESS;
+}
+
+static u8 idxd_vfio_release_int_handle(struct idxd_vfio_device *vfio_dev,
+				       u32 operand)
+{
+	struct idxd_device *idxd = vfio_dev->ivdev->idxd;
+	unsigned int handle = operand & GENMASK(15, 0);
+	unsigned int i;
+
+	atomic64_inc(&vfio_dev->ims_stats.release_cmds);
+
+	mutex_lock(&vfio_dev->irq_lock);
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		struct idxd_vfio_msix_entry *entry = &vfio_dev->msix_entries[i];
+
+		if (!entry->ims_allocated || entry->ims_handle != handle)
+			continue;
+
+		idxd_vfio_clear_ims_entry(vfio_dev, entry);
+		idxd_vfio_assert_ims_entry_clear_locked(vfio_dev, entry,
+							"release-int-handle-clear",
+							false, false);
+		idxd_vfio_forget_ims_handle(entry);
+		entry->pending = false;
+		mutex_unlock(&vfio_dev->irq_lock);
+
+		idxd_vfio_free_ims_irq(entry);
+		if (idxd->request_int_handles &&
+		    idxd_device_release_int_handle(idxd, handle, IDXD_IRQ_IMS)) {
+			atomic64_inc(&vfio_dev->ims_stats.release_errors);
+			return IDXD_CMDSTS_HW_ERR;
+		}
+		atomic64_inc(&vfio_dev->ims_stats.handles_released);
+		idxd_vfio_assert_ims_entry_clear(vfio_dev, entry,
+						 "release-int-handle",
+						 true, true);
+		return IDXD_CMDSTS_SUCCESS;
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	atomic64_inc(&vfio_dev->ims_stats.release_errors);
+	atomic64_inc(&vfio_dev->ims_stats.release_unallocated);
+	return IDXD_CMDSTS_ERR_INVAL_INT_IDX;
+}
+
+static int idxd_vfio_revoke_ims_vector(struct idxd_vfio_device *vfio_dev,
+				       unsigned int vector)
+{
+	struct idxd_device *idxd = vfio_dev->ivdev->idxd;
+	struct idxd_vfio_msix_entry *entry;
+	int handle;
+
+	if (vector >= idxd_vfio_msix_count(vfio_dev) ||
+	    !idxd_vfio_msix_vector_uses_ims(vector))
+		return -EINVAL;
+
+	entry = &vfio_dev->msix_entries[vector];
+
+	mutex_lock(&vfio_dev->irq_lock);
+	if (!entry->ims_allocated) {
+		mutex_unlock(&vfio_dev->irq_lock);
+		return -ENOENT;
+	}
+
+	handle = entry->ims_handle;
+	idxd_vfio_clear_ims_entry_hw(vfio_dev, entry);
+	entry->ims_programmed = false;
+	idxd_vfio_forget_ims_handle(entry);
+	entry->pending = false;
+	entry->ims_revoked = true;
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	idxd_vfio_free_ims_irq(entry);
+	if (idxd->request_int_handles &&
+	    idxd_device_release_int_handle(idxd, handle, IDXD_IRQ_IMS))
+		return -EIO;
+
+	atomic64_inc(&vfio_dev->ims_stats.revoked_vectors);
+	return 0;
+}
+
+static int idxd_vfio_revoke_ims_handles(struct idxd_vfio_device *vfio_dev,
+					unsigned int vector)
+{
+	unsigned int i, start, end;
+	unsigned int revoked = 0;
+	int rc = 0;
+
+	atomic64_inc(&vfio_dev->ims_stats.revoke_cmds);
+
+	if (vector == VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_VECTOR_ALL) {
+		start = 0;
+		end = idxd_vfio_msix_count(vfio_dev);
+	} else {
+		start = vector;
+		end = vector + 1;
+	}
+
+	for (i = start; i < end; i++) {
+		if (!idxd_vfio_msix_vector_uses_ims(i))
+			continue;
+
+		rc = idxd_vfio_revoke_ims_vector(vfio_dev, i);
+		if (!rc) {
+			revoked++;
+			continue;
+		}
+		if (rc == -ENOENT &&
+		    vector == VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_VECTOR_ALL) {
+			rc = 0;
+			continue;
+		}
+		break;
+	}
+
+	if (rc) {
+		atomic64_inc(&vfio_dev->ims_stats.revoke_errors);
+		return rc;
+	}
+	if (!revoked) {
+		atomic64_inc(&vfio_dev->ims_stats.revoke_errors);
+		return -ENOENT;
+	}
+
+	mutex_lock(&vfio_dev->bar0_lock);
+	vfio_dev->intcause |= IDXD_INTC_INT_HANDLE_REVOKED;
+	mutex_unlock(&vfio_dev->bar0_lock);
+	idxd_vfio_msix_signal(vfio_dev, 0);
+
+	return 0;
+}
+
+static int
+idxd_vfio_ims_selftest_find_idle_vector(struct idxd_vfio_device *vfio_dev,
+					unsigned int *vector)
+{
+	unsigned int i;
+	int rc = 0;
+
+	mutex_lock(&vfio_dev->pasid_lock);
+	if (vfio_dev->idev)
+		rc = -EBUSY;
+	mutex_unlock(&vfio_dev->pasid_lock);
+	if (rc)
+		return rc;
+
+	mutex_lock(&vfio_dev->irq_lock);
+	*vector = UINT_MAX;
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		struct idxd_vfio_msix_entry *entry = &vfio_dev->msix_entries[i];
+
+		if (vfio_dev->msix_trigger[i] || entry->ims_configured ||
+		    entry->ims_programmed || entry->host_irq_requested) {
+			rc = -EBUSY;
+			break;
+		}
+
+		if (*vector == UINT_MAX &&
+		    idxd_vfio_msix_vector_uses_ims(i) &&
+		    entry->ims_allocated)
+			*vector = i;
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	if (rc)
+		return rc;
+	if (*vector == UINT_MAX)
+		return -ENODEV;
+
+	return 0;
+}
+
+static int idxd_vfio_run_ims_selftest(struct idxd_vfio_device *vfio_dev)
+{
+	struct device *dev = vdev_confdev(vfio_dev->ivdev);
+	struct idxd_vfio_msix_entry *entry;
+	unsigned int vector;
+	u16 handle, duplicate;
+	u8 status;
+	int rc;
+
+	atomic64_inc(&vfio_dev->ims_stats.selftest_runs);
+
+	rc = idxd_vfio_ims_selftest_find_idle_vector(vfio_dev, &vector);
+	if (rc)
+		goto fail;
+
+	status = idxd_vfio_request_int_handle(vfio_dev, 0, &handle);
+	if (status != IDXD_CMDSTS_ERR_INVAL_INT_IDX) {
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: vector 0 request returned %#x\n",
+			 status);
+		goto fail;
+	}
+
+	status = idxd_vfio_request_int_handle(vfio_dev,
+					      idxd_vfio_msix_count(vfio_dev),
+					      &handle);
+	if (status != IDXD_CMDSTS_ERR_INVAL_INT_IDX) {
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: invalid vector request returned %#x\n",
+			 status);
+		goto fail;
+	}
+
+	status = idxd_vfio_release_int_handle(vfio_dev, INVALID_INT_HANDLE);
+	if (status != IDXD_CMDSTS_ERR_INVAL_INT_IDX) {
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: invalid handle release returned %#x\n",
+			 status);
+		goto fail;
+	}
+
+	status = idxd_vfio_request_int_handle(vfio_dev, vector, &handle);
+	if (status != IDXD_CMDSTS_SUCCESS) {
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: vector %u request returned %#x\n",
+			 vector, status);
+		goto fail;
+	}
+
+	status = idxd_vfio_request_int_handle(vfio_dev, vector, &duplicate);
+	if (status != IDXD_CMDSTS_SUCCESS || duplicate != handle) {
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: duplicate request status %#x handle %u expected %u\n",
+			 status, duplicate, handle);
+		goto fail;
+	}
+
+	entry = &vfio_dev->msix_entries[vector];
+	if (!idxd_vfio_assert_ims_entry_clear(vfio_dev, entry,
+					      "selftest-duplicate-request",
+					      true, false)) {
+		rc = -EIO;
+		goto fail;
+	}
+
+	status = idxd_vfio_release_int_handle(vfio_dev, handle);
+	if (status != IDXD_CMDSTS_SUCCESS) {
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: handle %u release returned %#x\n",
+			 handle, status);
+		goto fail;
+	}
+
+	if (!idxd_vfio_assert_ims_entry_clear(vfio_dev, entry,
+					      "selftest-release",
+					      true, true)) {
+		rc = -EIO;
+		goto fail;
+	}
+
+	status = idxd_vfio_release_int_handle(vfio_dev, handle);
+	if (status != IDXD_CMDSTS_ERR_INVAL_INT_IDX) {
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: duplicate release returned %#x\n",
+			 status);
+		goto fail;
+	}
+
+	status = idxd_vfio_request_int_handle(vfio_dev, vector, &handle);
+	if (status != IDXD_CMDSTS_SUCCESS) {
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: vector %u re-request returned %#x\n",
+			 vector, status);
+		goto fail;
+	}
+
+	if (!idxd_vfio_assert_ims_entry_clear(vfio_dev, entry,
+					      "selftest-rerequest",
+					      true, false)) {
+		rc = -EIO;
+		goto fail;
+	}
+
+	rc = idxd_vfio_revoke_ims_handles(vfio_dev, vector);
+	if (rc) {
+		dev_warn(dev,
+			 "IMS selftest failed: vector %u revoke returned %d\n",
+			 vector, rc);
+		goto fail;
+	}
+
+	mutex_lock(&vfio_dev->irq_lock);
+	if (!entry->ims_revoked || entry->ims_allocated) {
+		mutex_unlock(&vfio_dev->irq_lock);
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: vector %u revoke state invalid\n",
+			 vector);
+		goto fail;
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	mutex_lock(&vfio_dev->bar0_lock);
+	if (!(vfio_dev->intcause & IDXD_INTC_INT_HANDLE_REVOKED)) {
+		mutex_unlock(&vfio_dev->bar0_lock);
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: revoke did not set INTCAUSE\n");
+		goto fail;
+	}
+	vfio_dev->intcause &= ~IDXD_INTC_INT_HANDLE_REVOKED;
+	mutex_unlock(&vfio_dev->bar0_lock);
+
+	mutex_lock(&vfio_dev->irq_lock);
+	vfio_dev->msix_entries[0].pending = false;
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	status = idxd_vfio_request_int_handle(vfio_dev, vector, &handle);
+	if (status != IDXD_CMDSTS_SUCCESS) {
+		rc = -EIO;
+		dev_warn(dev,
+			 "IMS selftest failed: vector %u post-revoke request returned %#x\n",
+			 vector, status);
+		goto fail;
+	}
+
+	if (!idxd_vfio_assert_ims_entry_clear(vfio_dev, entry,
+					      "selftest-post-revoke-request",
+					      true, false)) {
+		rc = -EIO;
+		goto fail;
+	}
+
+	dev_info(dev, "IMS selftest passed on vector %u handle %u\n",
+		 vector, handle);
+	return 0;
+
+fail:
+	atomic64_inc(&vfio_dev->ims_stats.selftest_failures);
+	return rc;
+}
+
 static void idxd_vfio_exec_cmd(struct idxd_vfio_device *vfio_dev, u32 val)
 {
 	union idxd_command_reg cmd = { .bits = val };
 	u8 status = IDXD_CMDSTS_SUCCESS;
+	u16 result = 0;
 
 	switch (cmd.cmd) {
 	case IDXD_CMD_ENABLE_DEVICE:
@@ -1493,12 +2829,19 @@ static void idxd_vfio_exec_cmd(struct idxd_vfio_device *vfio_dev, u32 val)
 	case IDXD_CMD_DRAIN_PASID:
 	case IDXD_CMD_ABORT_PASID:
 		break;
+	case IDXD_CMD_REQUEST_INT_HANDLE:
+		status = idxd_vfio_request_int_handle(vfio_dev, cmd.operand,
+						      &result);
+		break;
+	case IDXD_CMD_RELEASE_INT_HANDLE:
+		status = idxd_vfio_release_int_handle(vfio_dev, cmd.operand);
+		break;
 	default:
 		status = IDXD_CMDSTS_INVAL_CMD;
 		break;
 	}
 
-	idxd_vfio_complete_cmd(vfio_dev, cmd, status, 0);
+	idxd_vfio_complete_cmd(vfio_dev, cmd, status, result);
 }
 
 static bool idxd_vfio_wqcfg_write(struct idxd_vfio_device *vfio_dev,
@@ -1554,6 +2897,56 @@ static bool idxd_vfio_wqcfg_write(struct idxd_vfio_device *vfio_dev,
 	return true;
 }
 
+static bool idxd_vfio_msix_table_write(struct idxd_vfio_device *vfio_dev,
+				       loff_t pos, u32 val)
+{
+	struct idxd_vfio_msix_entry *entry;
+	u32 table_size, offset, field;
+	unsigned int vector;
+
+	table_size = idxd_vfio_msix_count(vfio_dev) * PCI_MSIX_ENTRY_SIZE;
+	if (pos < IDXD_VDEV_MSIX_TABLE_OFFSET ||
+	    pos >= IDXD_VDEV_MSIX_TABLE_OFFSET + table_size)
+		return false;
+	if (!IS_ALIGNED(pos, sizeof(u32)))
+		return true;
+
+	offset = pos - IDXD_VDEV_MSIX_TABLE_OFFSET;
+	vector = offset / PCI_MSIX_ENTRY_SIZE;
+	field = offset % PCI_MSIX_ENTRY_SIZE;
+	entry = &vfio_dev->msix_entries[vector];
+
+	mutex_lock(&vfio_dev->irq_lock);
+	switch (field) {
+	case PCI_MSIX_ENTRY_LOWER_ADDR:
+		entry->msg_addr_lo = val;
+		if (entry->ims_programmed)
+			idxd_vfio_write_ims_entry(vfio_dev, entry);
+		break;
+	case PCI_MSIX_ENTRY_UPPER_ADDR:
+		entry->msg_addr_hi = val;
+		if (entry->ims_programmed)
+			idxd_vfio_write_ims_entry(vfio_dev, entry);
+		break;
+	case PCI_MSIX_ENTRY_DATA:
+		entry->msg_data = val;
+		if (entry->ims_programmed)
+			idxd_vfio_write_ims_entry(vfio_dev, entry);
+		break;
+	case PCI_MSIX_ENTRY_VECTOR_CTRL:
+		entry->vector_ctrl = val;
+		if (entry->ims_programmed)
+			idxd_vfio_write_ims_entry(vfio_dev, entry);
+		idxd_vfio_msix_flush_pending_locked(vfio_dev, vector);
+		break;
+	default:
+		break;
+	}
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	return true;
+}
+
 static ssize_t idxd_vfio_bar0_write(struct idxd_vfio_device *vfio_dev,
 				    const char __user *buf, size_t count,
 				    loff_t pos)
@@ -1568,6 +2961,8 @@ static ssize_t idxd_vfio_bar0_write(struct idxd_vfio_device *vfio_dev,
 	if (count == sizeof(val)) {
 		if (copy_from_user(&val, buf, sizeof(val)))
 			goto err_fault;
+		if (idxd_vfio_msix_table_write(vfio_dev, pos, val))
+			goto out_unlock;
 		if (idxd_vfio_wqcfg_write(vfio_dev, pos, val))
 			goto out_unlock;
 		if (pos == IDXD_GENCFG_OFFSET) {
@@ -1625,18 +3020,22 @@ static int idxd_vfio_bar2_pos(struct idxd_vfio_device *vfio_dev, loff_t pos,
 	return 0;
 }
 
-static bool idxd_vfio_bar2_mmap_prot(struct idxd_vwq *vwq,
-				     enum idxd_vfio_bar2_portal portal,
-				     enum idxd_portal_prot *prot)
+static bool idxd_vfio_bar2_mmap_portal(struct idxd_vwq *vwq,
+				       enum idxd_vfio_bar2_portal portal,
+				       unsigned int *phys_portal)
 {
 	switch (portal) {
 	case IDXD_VFIO_BAR2_LIMITED:
-		*prot = IDXD_PORTAL_LIMITED;
+		/*
+		 * The VDEV exposes virtual MSI-X portals to the guest but maps
+		 * them to physical IMS portals. Keep GENCAP.IMS hidden for now.
+		 */
+		*phys_portal = IDXD_VFIO_BAR2_IMS;
 		return true;
 	case IDXD_VFIO_BAR2_UNLIMITED:
 		if (vwq->shared)
 			return false;
-		*prot = IDXD_PORTAL_UNLIMITED;
+		*phys_portal = IDXD_VFIO_BAR2_IMS;
 		return true;
 	case IDXD_VFIO_BAR2_MSIX:
 	case IDXD_VFIO_BAR2_IMS:
@@ -2161,6 +3560,9 @@ static ssize_t idxd_vfio_write(struct vfio_device *vdev, const char __user *buf,
 		ret = min_t(size_t, count, sizeof(vfio_dev->config) - pos);
 		if (copy_from_user(vfio_dev->config + pos, buf, ret))
 			return -EFAULT;
+		if (pos <= IDXD_VDEV_MSIX_CAP_OFFSET + PCI_MSIX_FLAGS + 1 &&
+		    pos + ret > IDXD_VDEV_MSIX_CAP_OFFSET + PCI_MSIX_FLAGS)
+			idxd_vfio_msix_flush_all_pending(vfio_dev);
 		break;
 	default:
 		return -EINVAL;
@@ -2370,7 +3772,7 @@ static int idxd_vfio_mmap(struct vfio_device *vdev, struct vm_area_struct *vma)
 		  PAGE_SHIFT;
 	struct idxd_vwq *vwq;
 	enum idxd_vfio_bar2_portal portal;
-	enum idxd_portal_prot prot;
+	unsigned int phys_portal;
 	u64 portal_offset;
 	phys_addr_t paddr;
 	int rc;
@@ -2387,7 +3789,8 @@ static int idxd_vfio_mmap(struct vfio_device *vdev, struct vm_area_struct *vma)
 	if (rc)
 		return rc;
 
-	if (portal_offset || !idxd_vfio_bar2_mmap_prot(vwq, portal, &prot))
+	if (portal_offset ||
+	    !idxd_vfio_bar2_mmap_portal(vwq, portal, &phys_portal))
 		return -EINVAL;
 
 	if (!idxd_vfio_get_default_pasid(vfio_dev, NULL))
@@ -2397,7 +3800,8 @@ static int idxd_vfio_mmap(struct vfio_device *vdev, struct vm_area_struct *vma)
 		return -EPERM;
 
 	paddr = pci_resource_start(vwq->wq->idxd->pdev, IDXD_WQ_BAR);
-	paddr += idxd_get_wq_portal_full_offset(vwq->wq->id, prot);
+	paddr += ((vwq->wq->id * IDXD_VDEV_PORTALS_PER_WQ + phys_portal) <<
+		  PAGE_SHIFT);
 
 	vm_flags_set(vma, VM_ALLOW_ANY_UNCACHED | VM_IO | VM_PFNMAP |
 		     VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP);
@@ -2444,6 +3848,10 @@ static void idxd_vfio_unbind_iommufd(struct vfio_device *vdev)
 	vfio_dev->pasid_attached = false;
 	mutex_unlock(&vfio_dev->pasid_lock);
 
+	idxd_vfio_clear_all_ims_entries(vfio_dev);
+	idxd_vfio_free_unused_ims_irqs(vfio_dev);
+	idxd_vfio_assert_all_ims_clear(vfio_dev, "iommufd-unbind", true);
+
 	mutex_lock(&vfio_dev->bar0_lock);
 	rc = idxd_vfio_restore_all_wq_pasids(vfio_dev);
 	if (rc)
@@ -2478,6 +3886,7 @@ static int idxd_vfio_pasid_attach_ioas(struct vfio_device *vdev, u32 pasid,
 		container_of(vdev, struct idxd_vfio_device, vdev);
 	struct idxd_vfio_pasid_entry *entry, *old;
 	bool inserted = false;
+	int ims_rc;
 	int rc;
 
 	if (pasid == IOMMU_NO_PASID || pasid == IOMMU_PASID_INVALID)
@@ -2519,6 +3928,14 @@ static int idxd_vfio_pasid_attach_ioas(struct vfio_device *vdev, u32 pasid,
 
 	if (!inserted)
 		kfree(entry);
+	if (!rc) {
+		ims_rc = idxd_vfio_program_pending_ims_for_pasid(vfio_dev,
+								 pasid);
+		if (ims_rc)
+			dev_warn(vdev_confdev(vfio_dev->ivdev),
+				 "failed to program deferred IMS entries for PASID %u: %d\n",
+				 pasid, ims_rc);
+	}
 
 	return rc;
 }
@@ -2548,6 +3965,11 @@ static void idxd_vfio_pasid_detach_ioas(struct vfio_device *vdev, u32 pasid)
 		kfree(entry);
 		return;
 	}
+
+	idxd_vfio_clear_ims_entries_for_pasid(vfio_dev, entry->host_pasid);
+	idxd_vfio_free_unused_ims_irqs(vfio_dev);
+	idxd_vfio_assert_no_ims_for_pasid(vfio_dev, entry->host_pasid,
+					  "pasid-detach");
 
 	mutex_lock(&vfio_dev->bar0_lock);
 	rc = idxd_vfio_restore_wqs_for_pasid(vfio_dev, entry->host_pasid);
@@ -2750,12 +4172,190 @@ static int idxd_vfio_pasid_feature(struct vfio_device *vdev, u32 flags,
 	return copy_to_user(arg, &ctrl, minsz) ? -EFAULT : 0;
 }
 
+static int idxd_vfio_program_ims_entry(struct idxd_vfio_device *vfio_dev,
+				       struct vfio_device_feature_idxd_siov_ims *ctrl)
+{
+	struct idxd_vfio_msix_entry *entry;
+	ioasid_t host_pasid = ctrl->host_pasid;
+	bool deferred = false;
+	int rc = 0;
+
+	atomic64_inc(&vfio_dev->ims_stats.program_cmds);
+
+	if (ctrl->vector >= idxd_vfio_msix_count(vfio_dev)) {
+		atomic64_inc(&vfio_dev->ims_stats.program_errors);
+		return -EINVAL;
+	}
+	if (ctrl->flags & ~IDXD_VFIO_IMS_VALID_FLAGS) {
+		atomic64_inc(&vfio_dev->ims_stats.program_errors);
+		return -EINVAL;
+	}
+
+	entry = &vfio_dev->msix_entries[ctrl->vector];
+
+	if (!idxd_vfio_msix_vector_uses_ims(ctrl->vector)) {
+		mutex_lock(&vfio_dev->irq_lock);
+		entry->msg_addr_lo = lower_32_bits(ctrl->msg_addr);
+		entry->msg_addr_hi = upper_32_bits(ctrl->msg_addr);
+		entry->msg_data = ctrl->msg_data;
+		entry->host_pasid = IOMMU_PASID_INVALID;
+		entry->ims_ignore =
+			!!(ctrl->flags &
+			   VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_IGNORE);
+		if (ctrl->flags & VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_MASK)
+			entry->vector_ctrl |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
+		else
+			entry->vector_ctrl &= ~PCI_MSIX_ENTRY_CTRL_MASKBIT;
+		idxd_vfio_msix_flush_pending_locked(vfio_dev, ctrl->vector);
+		mutex_unlock(&vfio_dev->irq_lock);
+		return 0;
+	}
+
+	if (!(ctrl->flags & VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_PASID)) {
+		if (!idxd_vfio_get_default_pasid(vfio_dev, &host_pasid)) {
+			atomic64_inc(&vfio_dev->ims_stats.program_errors);
+			return -ENOENT;
+		}
+	} else if (!idxd_vfio_valid_pasid(host_pasid)) {
+		atomic64_inc(&vfio_dev->ims_stats.program_errors);
+		return -EINVAL;
+	}
+
+	mutex_lock(&vfio_dev->irq_lock);
+	entry->msg_addr_lo = lower_32_bits(ctrl->msg_addr);
+	entry->msg_addr_hi = upper_32_bits(ctrl->msg_addr);
+	entry->msg_data = ctrl->msg_data;
+	entry->host_pasid = host_pasid;
+	entry->ims_configured = true;
+	entry->ims_ignore =
+		!!(ctrl->flags & VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_IGNORE);
+	if (ctrl->flags & VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_MASK)
+		entry->vector_ctrl |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
+	else
+		entry->vector_ctrl &= ~PCI_MSIX_ENTRY_CTRL_MASKBIT;
+
+	rc = idxd_vfio_try_program_ims_locked(vfio_dev, entry, &deferred);
+	if (deferred)
+		atomic64_inc(&vfio_dev->ims_stats.program_deferred);
+
+	mutex_unlock(&vfio_dev->irq_lock);
+	if (rc)
+		atomic64_inc(&vfio_dev->ims_stats.program_errors);
+	return rc;
+}
+
+static int idxd_vfio_clear_ims_vector(struct idxd_vfio_device *vfio_dev,
+				      unsigned int vector)
+{
+	struct idxd_vfio_msix_entry *entry;
+
+	atomic64_inc(&vfio_dev->ims_stats.clear_cmds);
+
+	if (vector >= idxd_vfio_msix_count(vfio_dev)) {
+		atomic64_inc(&vfio_dev->ims_stats.clear_errors);
+		return -EINVAL;
+	}
+
+	entry = &vfio_dev->msix_entries[vector];
+
+	mutex_lock(&vfio_dev->irq_lock);
+	idxd_vfio_clear_ims_entry(vfio_dev, entry);
+	entry->pending = false;
+	mutex_unlock(&vfio_dev->irq_lock);
+	idxd_vfio_free_ims_irq(entry);
+	idxd_vfio_assert_ims_entry_clear(vfio_dev, entry, "ims-clear",
+					 true, false);
+
+	return 0;
+}
+
+static int idxd_vfio_get_ims_entry(struct idxd_vfio_device *vfio_dev,
+				   struct vfio_device_feature_idxd_siov_ims *ctrl)
+{
+	struct idxd_vfio_msix_entry *entry;
+	u32 ims_ctrl;
+
+	if (ctrl->vector >= idxd_vfio_msix_count(vfio_dev))
+		return -EINVAL;
+
+	entry = &vfio_dev->msix_entries[ctrl->vector];
+
+	mutex_lock(&vfio_dev->irq_lock);
+	ctrl->msg_addr = ((u64)entry->msg_addr_hi << 32) | entry->msg_addr_lo;
+	ctrl->msg_data = entry->msg_data;
+	ctrl->host_pasid = entry->host_pasid;
+	ctrl->flags = 0;
+	if (entry->vector_ctrl & PCI_MSIX_ENTRY_CTRL_MASKBIT)
+		ctrl->flags |= VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_MASK;
+	if (entry->ims_ignore)
+		ctrl->flags |= VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_IGNORE;
+	if (entry->ims_configured)
+		ctrl->flags |= VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_PASID;
+	if (entry->ims_revoked)
+		ctrl->flags |= VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_REVOKED;
+	ims_ctrl = idxd_vfio_read_ims_entry_ctrl(vfio_dev, entry);
+	if (entry->pending || (ims_ctrl & IDXD_VFIO_IMS_CTRL_PENDING))
+		ctrl->flags |= VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_PENDING;
+	mutex_unlock(&vfio_dev->irq_lock);
+
+	return 0;
+}
+
+static int idxd_vfio_ims_feature(struct vfio_device *vdev, u32 flags,
+				 void __user *arg, size_t argsz)
+{
+	size_t minsz =
+		offsetofend(struct vfio_device_feature_idxd_siov_ims,
+			    __reserved);
+	struct idxd_vfio_device *vfio_dev =
+		container_of(vdev, struct idxd_vfio_device, vdev);
+	struct vfio_device_feature_idxd_siov_ims ctrl;
+	int rc;
+
+	rc = vfio_check_feature(flags, argsz,
+				VFIO_DEVICE_FEATURE_GET |
+				VFIO_DEVICE_FEATURE_SET,
+				minsz);
+	if (rc != 1)
+		return rc;
+
+	if (copy_from_user(&ctrl, arg, minsz))
+		return -EFAULT;
+	if (ctrl.__reserved)
+		return -EINVAL;
+
+	if (flags & VFIO_DEVICE_FEATURE_SET) {
+		switch (ctrl.op) {
+		case VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_PROGRAM:
+			return idxd_vfio_program_ims_entry(vfio_dev, &ctrl);
+		case VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_CLEAR:
+			return idxd_vfio_clear_ims_vector(vfio_dev, ctrl.vector);
+		case VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_REVOKE:
+			return idxd_vfio_revoke_ims_handles(vfio_dev,
+							    ctrl.vector);
+		default:
+			return -EINVAL;
+		}
+	}
+
+	if (ctrl.op != VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_GET)
+		return -EINVAL;
+
+	rc = idxd_vfio_get_ims_entry(vfio_dev, &ctrl);
+	if (rc)
+		return rc;
+
+	return copy_to_user(arg, &ctrl, minsz) ? -EFAULT : 0;
+}
+
 static int idxd_vfio_ioctl_feature(struct vfio_device *vdev, u32 flags,
 				   void __user *arg, size_t argsz)
 {
 	switch (flags & VFIO_DEVICE_FEATURE_MASK) {
 	case VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID:
 		return idxd_vfio_pasid_feature(vdev, flags, arg, argsz);
+	case VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS:
+		return idxd_vfio_ims_feature(vdev, flags, arg, argsz);
 	default:
 		return -ENOTTY;
 	}
@@ -2774,6 +4374,8 @@ static int idxd_vfio_reset_device(struct idxd_vfio_device *vfio_dev)
 		idxd_vfio_reset_bar0(vfio_dev);
 	}
 	mutex_unlock(&vfio_dev->bar0_lock);
+	idxd_vfio_free_unused_ims_irqs(vfio_dev);
+	idxd_vfio_assert_all_ims_clear(vfio_dev, "device-reset", true);
 
 	return rc;
 }
@@ -2831,6 +4433,9 @@ static void idxd_vfio_close_device(struct vfio_device *vdev)
 		container_of(vdev, struct idxd_vfio_device, vdev);
 
 	idxd_vfio_flush_bar2_forward(vfio_dev);
+	idxd_vfio_clear_all_ims_entries(vfio_dev);
+	idxd_vfio_free_unused_ims_irqs(vfio_dev);
+	idxd_vfio_assert_all_ims_clear(vfio_dev, "device-close", true);
 	idxd_vfio_msix_disable(vfio_dev);
 }
 
@@ -2853,18 +4458,133 @@ static const struct vfio_device_ops idxd_vfio_ops = {
 
 static int idxd_vfio_init_irqs(struct idxd_vfio_device *vfio_dev)
 {
+	unsigned int i;
+	int rc;
+
 	vfio_dev->msix_trigger =
 		kcalloc(idxd_vfio_msix_count(vfio_dev),
 			sizeof(*vfio_dev->msix_trigger), GFP_KERNEL);
 	if (!vfio_dev->msix_trigger)
 		return -ENOMEM;
 
+	vfio_dev->msix_entries =
+		kcalloc(idxd_vfio_msix_count(vfio_dev),
+			sizeof(*vfio_dev->msix_entries), GFP_KERNEL);
+	if (!vfio_dev->msix_entries) {
+		kfree(vfio_dev->msix_trigger);
+		vfio_dev->msix_trigger = NULL;
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		vfio_dev->msix_entries[i].vfio_dev = vfio_dev;
+		vfio_dev->msix_entries[i].vector = i;
+		vfio_dev->msix_entries[i].host_msix_vector = UINT_MAX;
+		vfio_dev->msix_entries[i].ims_index = UINT_MAX;
+		vfio_dev->msix_entries[i].ims_handle = INVALID_INT_HANDLE;
+		vfio_dev->msix_entries[i].host_irq = -1;
+		vfio_dev->msix_entries[i].vector_ctrl =
+			PCI_MSIX_ENTRY_CTRL_MASKBIT;
+		vfio_dev->msix_entries[i].host_pasid = IOMMU_PASID_INVALID;
+		vfio_dev->msix_entries[i].ims_ignore = true;
+	}
+
+	rc = idxd_vfio_alloc_ims_handles(vfio_dev);
+	if (rc) {
+		kfree(vfio_dev->msix_entries);
+		vfio_dev->msix_entries = NULL;
+		kfree(vfio_dev->msix_trigger);
+		vfio_dev->msix_trigger = NULL;
+	}
+
+	return rc;
+}
+
+static void idxd_vfio_release_ims_handles(struct idxd_vfio_device *vfio_dev)
+{
+	struct idxd_device *idxd = vfio_dev->ivdev->idxd;
+	unsigned int i;
+
+	if (!vfio_dev->msix_entries)
+		return;
+
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		struct idxd_vfio_msix_entry *entry = &vfio_dev->msix_entries[i];
+
+		if (!entry->ims_allocated)
+			continue;
+
+		idxd_vfio_clear_ims_entry(vfio_dev, entry);
+		idxd_vfio_assert_ims_entry_clear(vfio_dev, entry,
+						 "release-ims-handle-clear",
+						 false, false);
+		idxd_vfio_free_ims_irq(entry);
+		if (idxd->request_int_handles)
+			idxd_device_release_int_handle(idxd, entry->ims_handle,
+						       IDXD_IRQ_IMS);
+		idxd_vfio_forget_ims_handle(entry);
+		entry->pending = false;
+		atomic64_inc(&vfio_dev->ims_stats.handles_released);
+	}
+	idxd_vfio_clear_all_ims_entries(vfio_dev);
+	idxd_vfio_assert_all_ims_clear(vfio_dev, "release-ims-handles", true);
+}
+
+static int idxd_vfio_alloc_ims_handles(struct idxd_vfio_device *vfio_dev)
+{
+	struct idxd_device *idxd = vfio_dev->ivdev->idxd;
+	struct device *dev = vdev_confdev(vfio_dev->ivdev);
+	unsigned int i;
+	int rc;
+
+	if (!idxd_vfio_ims_supported(idxd))
+		return -EOPNOTSUPP;
+
+	for (i = 0; i < idxd_vfio_msix_count(vfio_dev); i++) {
+		struct idxd_vfio_msix_entry *entry = &vfio_dev->msix_entries[i];
+		int handle;
+
+		if (!idxd_vfio_msix_vector_uses_ims(i))
+			continue;
+		if (i >= idxd->irq_cnt) {
+			dev_err(dev,
+				"no host MSI-X vector for virtual vector %u\n",
+				i);
+			idxd_vfio_release_ims_handles(vfio_dev);
+			return -ENOSPC;
+		}
+
+		if (idxd->request_int_handles) {
+			rc = idxd_device_request_int_handle(idxd, i, &handle,
+							    IDXD_IRQ_IMS);
+			if (rc) {
+				dev_err(dev,
+					"failed to allocate IMS handle for vector %u: %d\n",
+					i, rc);
+				idxd_vfio_release_ims_handles(vfio_dev);
+				return rc;
+			}
+		} else {
+			handle = i;
+		}
+
+		entry->ims_handle = handle;
+		entry->ims_index = handle;
+		entry->host_msix_vector = i;
+		entry->ims_allocated = true;
+		idxd_vfio_clear_ims_entry(vfio_dev, entry);
+		atomic64_inc(&vfio_dev->ims_stats.handles_allocated);
+	}
+
 	return 0;
 }
 
 static void idxd_vfio_free_irqs(struct idxd_vfio_device *vfio_dev)
 {
+	idxd_vfio_release_ims_handles(vfio_dev);
 	idxd_vfio_msix_disable(vfio_dev);
+	kfree(vfio_dev->msix_entries);
+	vfio_dev->msix_entries = NULL;
 	kfree(vfio_dev->msix_trigger);
 	vfio_dev->msix_trigger = NULL;
 }
