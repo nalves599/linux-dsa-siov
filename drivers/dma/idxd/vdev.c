@@ -11,7 +11,7 @@
 #include "idxd.h"
 
 #define IDXD_VDEV_MODE_SHARED		"shared"
-#define IDXD_VDEV_MODE_EXCLUSIVE	"exclusive"
+#define IDXD_VDEV_MODE_DEDICATED	"dedicated"
 
 static void idxd_vwq_put(struct idxd_vwq *vwq)
 {
@@ -73,7 +73,7 @@ static const char *idxd_vdev_wq_state_name(enum idxd_wq_state state)
 
 static const char *idxd_vdev_wq_mode_name(bool shared)
 {
-	return shared ? IDXD_VDEV_MODE_SHARED : IDXD_VDEV_MODE_EXCLUSIVE;
+	return shared ? IDXD_VDEV_MODE_SHARED : IDXD_VDEV_MODE_DEDICATED;
 }
 
 static bool idxd_vdev_has_wq(struct idxd_vdev *vdev, struct idxd_wq *wq)
@@ -160,11 +160,12 @@ static int idxd_vdev_parse_wq_token(struct idxd_device *idxd, char *token,
 		*shared = wq_shared(*wq);
 	else if (sysfs_streq(mode, IDXD_VDEV_MODE_SHARED))
 		*shared = true;
-	else if (sysfs_streq(mode, IDXD_VDEV_MODE_EXCLUSIVE))
+	else if (sysfs_streq(mode, IDXD_VDEV_MODE_DEDICATED) ||
+		 sysfs_streq(mode, "d"))
 		*shared = false;
 	else {
 		dev_err(idxd_confdev(idxd),
-			"invalid VDEV WQ mode '%s' for wq%d.%d\n",
+			"invalid VDEV WQ mode '%s' for wq%d.%d; expected shared or dedicated\n",
 			mode, idxd->id, wq_id);
 		return -EINVAL;
 	}

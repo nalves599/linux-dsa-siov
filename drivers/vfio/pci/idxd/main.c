@@ -2215,7 +2215,7 @@ static u8 idxd_vfio_prepare_wq_pasid(struct idxd_vfio_device *vfio_dev,
 
 	/*
 	 * A WQ shared by multiple VDEVs keeps the host-configured physical
-	 * shared-mode PASID state. Exclusive WQs program the resolved host
+	 * shared-mode PASID state. Dedicated WQs program the resolved host
 	 * PASID, either from an explicit guest mapping or the VM default.
 	 */
 	if (vwq->shared)
